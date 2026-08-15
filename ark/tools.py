@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import os
+import signal
 import sqlite3
 import subprocess
+import threading
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -116,20 +119,77 @@ def _list_files(*, path: str = ".", pattern: str | None = None) -> str:
     return "\n".join(f"{e.name}{'/' if e.is_dir() else ''}" for e in entries)
 
 
+# session_id -> in-flight run_command processes, so `stop` can terminate
+# them (mine-capstone#485). Task cancellation alone cannot: the command runs
+# in a to_thread worker, and cancelling the awaiting task leaves the thread
+# — and the subprocess — running to its timeout.
+_active_procs: dict[str, set[subprocess.Popen]] = {}
+_KILL_GRACE_S = 5.0
+
+
+def _kill_group(proc: subprocess.Popen, sig: int) -> None:
+    try:
+        os.killpg(os.getpgid(proc.pid), sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _escalate(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        _kill_group(proc, signal.SIGKILL)
+
+
+def stop_session_commands(session_id: str) -> int:
+    """SIGTERM the process group of every in-flight run_command for the
+    session, escalating to SIGKILL after a grace period (the design note's
+    kill discipline). Returns the number of processes signalled. Safe from
+    the event loop: signalling is instant, escalation rides a timer thread.
+    """
+
+    procs = [p for p in _active_procs.get(session_id, set()) if p.poll() is None]
+    for proc in procs:
+        _kill_group(proc, signal.SIGTERM)
+        timer = threading.Timer(_KILL_GRACE_S, _escalate, args=(proc,))
+        timer.daemon = True
+        timer.start()
+    return len(procs)
+
+
 def _run_command(*, command: str, timeout_seconds: float = 60) -> str:
     timeout = min(float(timeout_seconds), 600)
+    ctx = _context.get(None)
+    session_id = ctx.session_id if ctx is not None else None
+    # start_new_session: own process group, so stop/timeout kills the whole
+    # tree (shell + children), not just the shell.
+    proc = subprocess.Popen(
+        command,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    if session_id is not None:
+        _active_procs.setdefault(session_id, set()).add(proc)
     try:
-        result = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=timeout
-        )
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as e:
+        _kill_group(proc, signal.SIGTERM)
+        try:
+            proc.communicate(timeout=_KILL_GRACE_S)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc, signal.SIGKILL)
+            proc.communicate()
         raise ToolError(f"command timed out after {timeout}s") from e
+    finally:
+        if session_id is not None:
+            _active_procs.get(session_id, set()).discard(proc)
     parts = []
-    if result.stdout:
-        parts.append(f"--- stdout ---\n{result.stdout.rstrip()}")
-    if result.stderr:
-        parts.append(f"--- stderr ---\n{result.stderr.rstrip()}")
-    parts.append(f"exit code: {result.returncode}")
+    if stdout:
+        parts.append(f"--- stdout ---\n{stdout.rstrip()}")
+    if stderr:
+        parts.append(f"--- stderr ---\n{stderr.rstrip()}")
+    parts.append(f"exit code: {proc.returncode}")
     return "\n".join(parts)
 
 

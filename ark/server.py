@@ -13,7 +13,7 @@ from typing import Any
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
-from . import broker, db, file_watcher, mcp, projects, runtime, skills, workspace as ws
+from . import broker, db, file_watcher, mcp, projects, runtime, skills, tools, workspace as ws
 from .config import Config
 from .scheduler import Scheduler
 from .types import AssistantText, UploadMessage, message_from_row
@@ -973,7 +973,23 @@ def create_app(config: Config) -> FastAPI:
                 t = cmd.get("type")
                 sid = cmd.get("session_id")
                 if t == "stop":
-                    # v1: no-op (mid-turn cancellation isn't supported).
+                    # Real mid-turn cancel (mine-capstone#485): cancel the
+                    # turn task (it publishes the terminal
+                    # `done {"stopped": true}` itself) and terminate any
+                    # in-flight run_command process group. Fire-and-forget
+                    # like user_message; stop with no running turn is a
+                    # silent no-op.
+                    if not sid or not isinstance(sid, str):
+                        await ws.send_json(
+                            {
+                                "type": "error",
+                                "code": "other",
+                                "message": "stop requires a string `session_id`",
+                            }
+                        )
+                        continue
+                    runtime.stop_turn(sid)
+                    tools.stop_session_commands(sid)
                     continue
                 if t != "user_message":
                     await ws.send_json(

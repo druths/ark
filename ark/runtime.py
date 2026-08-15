@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import sys
@@ -670,7 +671,7 @@ async def run_user_turn(
     agent: AgentConfig,
     session_id: str,
     user_text: str,
-    provider_factory=make_provider,
+    provider_factory=None,
     max_tokens: int | None = None,
 ) -> AsyncIterator[RuntimeEvent]:
     """Persist the user message, then drive the model → tools → model loop.
@@ -681,6 +682,13 @@ async def run_user_turn(
     `max_tokens`. Budget precedence: explicit arg > agent.max_turn_tokens
     > DEFAULT_TURN_TOKEN_BUDGET.
     """
+
+    # Late-bound provider_factory default (mirrors compact_session) — resolves
+    # the module attribute at call time so tests can inject via a
+    # `runtime.make_provider` monkeypatch. The def-time capture would have
+    # silently ignored that patch.
+    if provider_factory is None:
+        provider_factory = make_provider
 
     # Resolve the effective budget once at turn start.
     effective_budget = (
@@ -720,6 +728,12 @@ async def run_user_turn(
                 input_tokens=last_input_tokens,
                 context_window=context_window,
             )
+
+    # Late-bound default: resolve the module attribute at call time so tests
+    # can inject a stub via `runtime.make_provider` (the def-time default
+    # captured the original function and silently ignored that patch).
+    if provider_factory is None:
+        provider_factory = make_provider
 
     append_message(conn, session_id, UserText(text=user_text))
 
@@ -896,6 +910,33 @@ async def run_user_turn(
 
 
 # ---------------------------------------------------------------------------
+# In-flight turn registry (mine-capstone#485)
+# ---------------------------------------------------------------------------
+
+# session_id -> the asyncio.Task driving its in-flight turn. Registered by
+# run_and_publish itself (asyncio.current_task on entry), so every spawn
+# site — the WS handler, the scheduler — gets stop support without changes.
+# Ark has no per-session concurrency guard; if a client violates the
+# one-turn-at-a-time protocol the newest turn owns the slot.
+_active_turns: dict[str, "asyncio.Task"] = {}
+
+
+def stop_turn(session_id: str) -> bool:
+    """Cancel the in-flight turn for a session (the `stop` WS command).
+
+    Returns True when a running turn was cancelled. The cancelled task
+    publishes a terminal ``done {"stopped": true}`` itself, so every
+    subscriber sees the turn close.
+    """
+
+    task = _active_turns.get(session_id)
+    if task is None or task.done():
+        return False
+    task.cancel()
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Wire-format conversion + broker publishing
 # ---------------------------------------------------------------------------
 
@@ -988,6 +1029,9 @@ async def run_and_publish(
     DEFAULT_TURN_TOKEN_BUDGET.
     """
 
+    task = asyncio.current_task()
+    if task is not None:
+        _active_turns[session_id] = task
     try:
         async for evt in run_user_turn(
             conn=conn,
@@ -1001,6 +1045,21 @@ async def run_and_publish(
             wire["session_id"] = session_id
             wire["agent_name"] = agent.name
             broker.publish(session_id, wire)
+    except asyncio.CancelledError:
+        # Real mid-turn cancel (`stop`, mine-capstone#485): close the turn
+        # with a terminal event so clients aren't left mid-stream, then let
+        # the cancellation land (the task ends cancelled).
+        broker.publish(
+            session_id,
+            {
+                "type": "done",
+                "stop_reason": "stopped",
+                "stopped": True,
+                "session_id": session_id,
+                "agent_name": agent.name,
+            },
+        )
+        raise
     except Exception as e:  # noqa: BLE001
         # run_user_turn catches provider exceptions itself; this is for anything
         # that escapes (programming errors, broker failures, etc.).
@@ -1017,3 +1076,6 @@ async def run_and_publish(
                 "message": _format_provider_error_message(e, type(e).__name__, str(e)),
             },
         )
+    finally:
+        if task is not None and _active_turns.get(session_id) is task:
+            del _active_turns[session_id]
