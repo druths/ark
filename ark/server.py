@@ -298,16 +298,22 @@ def create_app(config: Config) -> FastAPI:
     async def create_session(name: str, request: Request):
         if name not in config.agents:
             raise HTTPException(404, "unknown agent")
-        # Body is optional. Accept an empty request, or `{context?, project_id?}`.
+        # Body is optional. Accept an empty request, or
+        # `{context?, project_id?, metadata?}`.
         ctx_text = ""
         project_id: str | None = None
+        metadata: dict | None = None
         try:
             body = await request.json()
             if isinstance(body, dict):
                 ctx_text = (body.get("context") or "").strip()
                 project_id = body.get("project_id") or None
+                metadata = body.get("metadata")
         except Exception:
             pass  # no/invalid body → just create the session
+
+        if metadata is not None and not isinstance(metadata, dict):
+            raise HTTPException(400, "metadata must be a JSON object")
 
         if project_id is not None:
             p = projects.get(conn, project_id)
@@ -315,7 +321,7 @@ def create_app(config: Config) -> FastAPI:
                 raise HTTPException(400, f"unknown or deleted project: {project_id!r}")
 
         sid = runtime.create_session(
-            conn, name, "conversational", project_id=project_id
+            conn, name, "conversational", project_id=project_id, metadata=metadata
         )
         if ctx_text:
             runtime.append_context(conn, sid, ctx_text)

@@ -110,6 +110,16 @@ MIGRATIONS: list[tuple[int, str]] = [
         # max_iterations=16 cap on the model→tools loop.
         "ALTER TABLE crons ADD COLUMN max_tokens INTEGER;",
     ),
+    (
+        7,
+        # Opaque client-supplied session metadata (JSON object). Stored
+        # server-side only and surfaced to skills via ToolContext.metadata —
+        # the same unforgeable channel as session_id. NEVER rendered into
+        # the system prompt or model-visible context: it exists precisely to
+        # carry per-session capabilities (e.g. a callback URL + secret pair)
+        # that must not transit the model.
+        "ALTER TABLE sessions ADD COLUMN metadata_json TEXT;",
+    ),
 ]
 
 

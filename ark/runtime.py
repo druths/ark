@@ -107,14 +107,39 @@ def create_session(
     kind: str = "conversational",
     project_id: str | None = None,
     cron_id: str | None = None,
+    metadata: dict | None = None,
 ) -> str:
     sid = str(uuid.uuid4())
     conn.execute(
-        "INSERT INTO sessions(id, agent_name, kind, created_at, project_id, cron_id) "
-        "VALUES (?,?,?,?,?,?)",
-        (sid, agent_name, kind, now_ms(), project_id, cron_id),
+        "INSERT INTO sessions(id, agent_name, kind, created_at, project_id, cron_id, "
+        "metadata_json) VALUES (?,?,?,?,?,?,?)",
+        (
+            sid,
+            agent_name,
+            kind,
+            now_ms(),
+            project_id,
+            cron_id,
+            json.dumps(metadata) if metadata else None,
+        ),
     )
     return sid
+
+
+def session_metadata(conn: sqlite3.Connection, session_id: str) -> dict:
+    """Client-supplied session metadata ({} when none). Server-side only:
+    surfaced to skills via ToolContext, never to the model."""
+
+    row = conn.execute(
+        "SELECT metadata_json FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    if row is None or not row["metadata_json"]:
+        return {}
+    try:
+        data = json.loads(row["metadata_json"])
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def session_project(conn: sqlite3.Connection, session_id: str) -> Project | None:
@@ -880,6 +905,7 @@ async def run_user_turn(
             session_id=session_id,
             cwd=agent.workspace,
             loaded_skills=skills_for_session,
+            metadata=session_metadata(conn, session_id),
         )
         for tc in pending_tool_calls:
             output, is_error = await tools.execute(tc.name, tc.input, ctx=ctx)
