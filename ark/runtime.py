@@ -803,6 +803,11 @@ async def run_user_turn(
                 system=system,
                 messages=turn_messages,
                 tools=active,
+                # Per-response output cap the provider gets on THIS call
+                # (SDK-level `max_tokens` kwarg). Distinct from `max_tokens`
+                # on run_user_turn (whole-turn token budget). Falls back to
+                # 4096 to match every provider adapter's def-time default.
+                max_tokens=agent.max_output_tokens or 4096,
             ):
                 if isinstance(evt, TextDelta):
                     turn_text += evt.text
