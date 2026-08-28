@@ -136,6 +136,31 @@ ark chat <agent> --session SID --context "..." # append to a resumed session
 you> /context <additional instructions>
 ```
 
+### Named blocks
+
+`POST .../context` accepts an optional `"name"`. A named block is
+REPLACED in the system prompt when the same name is appended again — the
+last text renders at the first occurrence's position, so a periodically
+refreshed block (a focus object, a mode note) costs one slot instead of
+growing the prompt every refresh. Unnamed appends stay additive. The
+response reports `replaced: true|false`. Rows in history are append-only;
+the dedupe is prompt-build-time only.
+
+`GET /agents/{name}/sessions/{sid}/context` returns the introspection
+view: `system_prompt_bytes`, `blocks[{name, bytes, seq}]` (deduped as
+rendered), `last_input_tokens`, `last_cached_input_tokens`,
+`context_window`, `compactions`.
+
+### Tool-result elision
+
+Old, oversized tool results are elided from the LLM's view (never from
+history) once the in-view result bytes exceed
+`tool_result_max_bytes` (64 KB): one pass replaces results older than the
+last `tool_result_keep_turns` (2) user turns and larger than
+`tool_result_elide_over` (2 KB) with
+`[tool result elided: N bytes; tool <name>; call <id> — re-run if needed]`.
+The single-pass hysteresis keeps the provider prompt cache warm.
+
 ## The event stream (unified per-client)
 
 Ark exposes a **single WebSocket per client** that carries events for every
@@ -273,6 +298,16 @@ history for audit and client rendering). See [Compaction](#compaction)
 below. If compaction is disabled or its summarizer call fails, the
 underlying `context_too_long` error surfaces as before and the recovery
 recipe (start a new session) still applies.
+
+### Cache telemetry
+
+`turn_usage` events and `TurnMetrics` rows carry `cached_input_tokens`
+and `cache_write_tokens`; `input_tokens` is ALWAYS the total prompt
+(providers that exclude cached tokens from their raw count are
+normalized). With `agents.<name>.prompt_caching` (default true), Anthropic
+paths (native + `anthropic/*` via OpenRouter) get `cache_control` markers
+on the system block and the conversation tail, so the repeated prefix is
+served from cache.
 
 ## Error tracking
 

@@ -238,7 +238,23 @@ def system_prompt(
         )
         out += proj
     if contexts:
-        joined = "\n\n".join(c.text for c in contexts if c.text.strip())
+        # Named blocks replace in place: the text of the LAST occurrence
+        # renders at the position of the FIRST; unnamed blocks stay additive.
+        latest_by_name: dict[str, str] = {}
+        for c in contexts:
+            if c.name:
+                latest_by_name[c.name] = c.text
+        effective: list[str] = []
+        seen_names: set[str] = set()
+        for c in contexts:
+            if c.name:
+                if c.name in seen_names:
+                    continue
+                seen_names.add(c.name)
+                effective.append(latest_by_name[c.name])
+            else:
+                effective.append(c.text)
+        joined = "\n\n".join(t for t in effective if t.strip())
         if joined:
             out += (
                 "\n\n---\n"
@@ -260,14 +276,26 @@ def system_prompt(
     return out
 
 
-def append_context(conn: sqlite3.Connection, session_id: str, text: str) -> int:
-    """Append a SessionContext message to a session. Returns the new total."""
+def append_context(
+    conn: sqlite3.Connection, session_id: str, text: str, name: str | None = None
+) -> tuple[int, bool]:
+    """Append a SessionContext message. Returns (total, replaced) — replaced
+    is True when ``name`` matches an existing named block, which the system
+    prompt then renders with THIS text at the original position (rows are
+    append-only; the dedupe is prompt-build-time)."""
 
-    append_message(conn, session_id, SessionContext(text=text))
-    return conn.execute(
+    replaced = False
+    if name:
+        history = load_history(conn, session_id)
+        replaced = any(
+            isinstance(m, SessionContext) and m.name == name for m in history
+        )
+    append_message(conn, session_id, SessionContext(text=text, name=name))
+    total = conn.execute(
         "SELECT COUNT(*) FROM messages WHERE session_id = ? AND role = 'session_context'",
         (session_id,),
     ).fetchone()[0]
+    return total, replaced
 
 
 def set_session_project(
@@ -386,6 +414,58 @@ Be complete over concise. The assistant will rely on this summary as its only me
 # summaries are excluded because their text is folded into the system prompt
 # via the compaction slice logic instead.
 _LLM_EXCLUDED = (SessionContext, TurnMetrics, RunError, CompactionSummary)
+
+
+def elide_tool_results(
+    messages: list[Message],
+    keep_turns: int = 2,
+    elide_over: int = 2048,
+    max_bytes: int = 65536,
+) -> list[Message]:
+    """In-memory tool-result elision (mine-capstone#697) — rows untouched.
+
+    HYSTERESIS by design: nothing happens until the total in-view
+    tool-result bytes exceed ``max_bytes``; then ONE pass replaces results
+    older than the last ``keep_turns`` user turns that are larger than
+    ``elide_over`` with a short stub naming the tool and call id. A
+    per-turn trim would change the prompt prefix every turn and bust the
+    provider prompt cache — one bulk pass keeps it warm between passes."""
+
+    total = sum(
+        len(m.output.encode("utf-8"))
+        for m in messages
+        if isinstance(m, ToolResult) and isinstance(m.output, str)
+    )
+    if total <= max_bytes:
+        return messages
+    # The index of the user turn ``keep_turns`` from the end — everything at
+    # or after it is protected.
+    user_indexes = [i for i, m in enumerate(messages) if isinstance(m, UserText)]
+    protected_from = user_indexes[-keep_turns] if len(user_indexes) >= keep_turns else 0
+    out: list[Message] = []
+    for i, m in enumerate(messages):
+        if (
+            isinstance(m, ToolResult)
+            and i < protected_from
+            and isinstance(m.output, str)
+            and len(m.output.encode("utf-8")) > elide_over
+        ):
+            size = len(m.output.encode("utf-8"))
+            out.append(
+                ToolResult(
+                    call_id=m.call_id,
+                    output=(
+                        f"[tool result elided: {size} bytes; tool "
+                        f"{m.name or 'unknown'}; call {m.call_id} — re-run "
+                        "if needed]"
+                    ),
+                    is_error=m.is_error,
+                    name=m.name,
+                )
+            )
+        else:
+            out.append(m)
+    return out
 
 
 def _rewrite_for_llm(messages: list[Message]) -> list[Message]:
@@ -567,6 +647,9 @@ async def compact_session(
             system=system,
             messages=to_summarize,
             tools=[],
+            # The summarizer reuses the session's exact prefix — caching it
+            # makes compaction nearly free on cache-capable providers.
+            prompt_caching=agent.prompt_caching,
         ):
             if isinstance(evt, TextDelta):
                 summary_text += evt.text
@@ -670,6 +753,12 @@ async def run_user_turn(
         turn_messages = _rewrite_for_llm(
             [m for m in slice_history if not isinstance(m, _LLM_EXCLUDED)]
         )
+        turn_messages = elide_tool_results(
+            turn_messages,
+            keep_turns=agent.tool_result_keep_turns,
+            elide_over=agent.tool_result_elide_over,
+            max_bytes=agent.tool_result_max_bytes,
+        )
         system = system_prompt(
             agent, contexts, project=project, compaction_summary=compaction_text
         )
@@ -683,6 +772,7 @@ async def run_user_turn(
                 system=system,
                 messages=turn_messages,
                 tools=active,
+                prompt_caching=agent.prompt_caching,
             ):
                 if isinstance(evt, TextDelta):
                     turn_text += evt.text
@@ -700,6 +790,8 @@ async def run_user_turn(
                             input_tokens=evt.input_tokens,
                             output_tokens=evt.output_tokens,
                             model=evt.model or agent.model,
+                            cached_input_tokens=evt.cached_input_tokens,
+                            cache_write_tokens=evt.cache_write_tokens,
                         ),
                     )
                     # Re-emit with the agent's known context_window so the
@@ -709,6 +801,8 @@ async def run_user_turn(
                         output_tokens=evt.output_tokens,
                         model=evt.model or agent.model,
                         context_window=context_window,
+                        cached_input_tokens=evt.cached_input_tokens,
+                        cache_write_tokens=evt.cache_write_tokens,
                     )
                 elif isinstance(evt, AssistantTurnEnd):
                     last_stop_reason = evt.stop_reason
@@ -830,6 +924,8 @@ def event_to_wire(evt: RuntimeEvent | Message) -> dict:
             "output_tokens": evt.output_tokens,
             "model": evt.model,
             "context_window": evt.context_window,
+            "cached_input_tokens": evt.cached_input_tokens,
+            "cache_write_tokens": evt.cache_write_tokens,
         }
     if isinstance(evt, RunErrorEvent):
         return {"type": "error", "code": evt.code, "message": evt.message}

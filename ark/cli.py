@@ -146,6 +146,7 @@ class _Ui:
         output_tokens: int,
         context_window: int | None,
         model: str,
+        cached_input_tokens: int = 0,
     ) -> None:
         """Dim per-turn token-usage indicator."""
         self._wipe_status()
@@ -160,6 +161,8 @@ class _Ui:
             )
         else:
             msg = f"in {input_tokens:,} · out {output_tokens:,}"
+        if cached_input_tokens and input_tokens:
+            msg += f" · {100 * cached_input_tokens / input_tokens:.0f}% cached"
         if model:
             msg += f" · {model}"
         sys.stderr.write(f"\033[2m[{msg}]\033[0m\n")
@@ -218,6 +221,7 @@ def _handle_event(ui: _Ui, evt: dict) -> None:
             int(evt.get("output_tokens", 0)),
             evt.get("context_window"),
             evt.get("model") or "",
+            cached_input_tokens=int(evt.get("cached_input_tokens", 0) or 0),
         )
     elif t == "error":
         code = evt.get("code") or "other"

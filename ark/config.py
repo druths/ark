@@ -66,6 +66,17 @@ class AgentConfig:
     # Automatic session compaction — see docs/sessions.md.
     compaction_enabled: bool = True
     compaction_threshold: float = 0.85  # fraction of context_window that triggers
+    # Prompt caching (mine-capstone#697): cache_control markers on providers
+    # that support them (Anthropic native + anthropic/* via OpenRouter).
+    prompt_caching: bool = True
+    # In-memory tool-result elision (never touches rows): once the in-view
+    # tool-result bytes exceed tool_result_max_bytes, ONE pass elides
+    # results older than the last tool_result_keep_turns user turns that
+    # are larger than tool_result_elide_over. Hysteresis by design — a
+    # per-turn trim would bust the prompt cache every turn.
+    tool_result_keep_turns: int = 2
+    tool_result_elide_over: int = 2048
+    tool_result_max_bytes: int = 65536
 
 
 @dataclass
@@ -263,6 +274,16 @@ def _agents(
             raise ConfigError(
                 f"agents.{name}.compaction_threshold must be a number strictly between 0 and 1"
             )
+        prompt_caching = cfg.get("prompt_caching", True)
+        if not isinstance(prompt_caching, bool):
+            raise ConfigError(f"agents.{name}.prompt_caching must be a boolean")
+
+        def _int_knob(key: str, default: int) -> int:
+            value = cfg.get(key, default)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ConfigError(f"agents.{name}.{key} must be a non-negative integer")
+            return value
+
         out[name] = AgentConfig(
             name=name,
             provider=provider,
@@ -274,5 +295,9 @@ def _agents(
             always_loaded_mcp_servers=list(always_mcp),
             compaction_enabled=compaction_enabled,
             compaction_threshold=float(compaction_threshold),
+            prompt_caching=prompt_caching,
+            tool_result_keep_turns=_int_knob("tool_result_keep_turns", 2),
+            tool_result_elide_over=_int_knob("tool_result_elide_over", 2048),
+            tool_result_max_bytes=_int_knob("tool_result_max_bytes", 65536),
         )
     return out

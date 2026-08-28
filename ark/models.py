@@ -28,6 +28,9 @@ KNOWN_CONTEXT_WINDOWS: dict[str, int] = {
     "gemini-2.5-pro": 1_048_576,
     "gemini-2.5-flash": 1_048_576,
     "gemini-3.1-pro-preview": 1_048_576,
+    # Moonshot (also reachable via OpenRouter's moonshotai/ namespace,
+    # which context_window_for's bare-name fallback resolves).
+    "kimi-k3": 256_000,
 }
 
 

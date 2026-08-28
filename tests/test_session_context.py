@@ -133,7 +133,7 @@ def test_post_context_appends_and_returns_count(ark_home, tmp_path):
         f"/agents/scribe/sessions/{sid}/context", headers=H, json={"context": "second"}
     )
     assert r.status_code == 200
-    assert r.json() == {"ok": True, "count": 2}
+    assert r.json() == {"ok": True, "count": 2, "replaced": False}
     history = runtime.load_history(app.state.conn, sid)
     contexts = [m for m in history if isinstance(m, SessionContext)]
     assert [c.text for c in contexts] == ["first", "second"]
@@ -205,7 +205,7 @@ async def test_session_context_filtered_from_llm_messages(ark_home, tmp_path):
     captured = {}
 
     class _StubProvider:
-        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096):
+        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096, prompt_caching=False):
             captured["system"] = system
             captured["messages"] = list(messages)
             from ark.types import AssistantTurnEnd

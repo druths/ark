@@ -320,8 +320,10 @@ def create_app(config: Config) -> FastAPI:
         text = (body.get("context") or "").strip()
         if not text:
             raise HTTPException(400, "missing or empty 'context'")
-        count = runtime.append_context(conn, sid, text)
-        return {"ok": True, "count": count}
+        raw_name = body.get("name")
+        block_name = str(raw_name).strip() or None if raw_name is not None else None
+        count, replaced = runtime.append_context(conn, sid, text, name=block_name)
+        return {"ok": True, "count": count, "replaced": replaced}
 
     @app.delete("/agents/{name}/sessions/{sid}")
     def delete_session(name: str, sid: str):
@@ -687,6 +689,64 @@ def create_app(config: Config) -> FastAPI:
         if not runtime.session_exists(conn, sid, name):
             raise HTTPException(404, "unknown session")
         return [_message_to_json(m) for m in runtime.load_history(conn, sid)]
+
+    @app.get("/agents/{name}/sessions/{sid}/context")
+    def get_session_context(name: str, sid: str):
+        """Context introspection (mine-capstone#697): what the system prompt
+        holds right now — its size, every context block (named blocks
+        deduped exactly as the prompt builder renders them), the latest
+        usage numbers and the compaction count."""
+        agent = config.agents.get(name)
+        if agent is None or not runtime.session_exists(conn, sid, name):
+            raise HTTPException(404, "unknown session")
+        from .models import context_window_for
+        from .types import CompactionSummary, SessionContext, TurnMetrics
+
+        history = runtime.load_history(conn, sid)
+        contexts = [m for m in history if isinstance(m, SessionContext)]
+        latest = None
+        for m in reversed(history):
+            if isinstance(m, TurnMetrics):
+                latest = m
+                break
+        compaction = None
+        for m in reversed(history):
+            if isinstance(m, CompactionSummary):
+                compaction = m
+                break
+        project = runtime.session_project(conn, sid)
+        system = runtime.system_prompt(
+            agent, contexts, project=project,
+            compaction_summary=compaction.text if compaction else None,
+        )
+        # Blocks exactly as the prompt renders them: named = last text at
+        # first position; unnamed additive.
+        latest_by_name = {c.name: c.text for c in contexts if c.name}
+        seen: set[str] = set()
+        blocks = []
+        for seq, c in enumerate(contexts):
+            if c.name:
+                if c.name in seen:
+                    continue
+                seen.add(c.name)
+                text = latest_by_name[c.name]
+            else:
+                text = c.text
+            blocks.append({
+                "name": c.name,
+                "bytes": len(text.encode("utf-8")),
+                "seq": seq,
+            })
+        return {
+            "system_prompt_bytes": len(system.encode("utf-8")),
+            "blocks": blocks,
+            "last_input_tokens": latest.input_tokens if latest else None,
+            "last_cached_input_tokens": latest.cached_input_tokens if latest else None,
+            "context_window": context_window_for(agent.model, agent.max_context_tokens),
+            "compactions": sum(
+                1 for m in history if isinstance(m, CompactionSummary)
+            ),
+        }
 
     # ------------------------------------------------------------------
     # File transfer: shared uploads bucket + arbitrary workspace downloads

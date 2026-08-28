@@ -94,11 +94,19 @@ class Project:
 class SessionContext:
     """Client-supplied per-session instructions, layered onto the system prompt.
 
-    Append-only: multiple SessionContext messages accumulate over the life of
-    the session. They are NOT sent to the LLM as conversation turns — the
-    runtime extracts them and appends to the system prompt instead."""
+    Append-only rows: multiple SessionContext messages accumulate over the
+    life of the session. They are NOT sent to the LLM as conversation turns —
+    the runtime extracts them and appends to the system prompt instead.
+
+    ``name`` (optional): a NAMED block is replaced in place when the same
+    name is appended again — the system prompt renders the text of the LAST
+    occurrence at the position of the FIRST, so a refreshed block (a focus
+    object, a mode note) does not grow the prompt forever. Unnamed blocks
+    keep the historical additive behavior. Rows are never mutated — the
+    dedupe happens at prompt-build time."""
 
     text: str
+    name: str | None = None
 
 
 @dataclass
@@ -112,6 +120,11 @@ class TurnMetrics:
     input_tokens: int
     output_tokens: int
     model: str = ""
+    # Prompt-cache telemetry (0 when the provider reports none): tokens read
+    # from cache and tokens written to it — both SUBSETS of input_tokens,
+    # which is always the TOTAL prompt size.
+    cached_input_tokens: int = 0
+    cache_write_tokens: int = 0
 
 
 @dataclass
@@ -247,6 +260,9 @@ class TurnUsageEvent:
     output_tokens: int
     model: str = ""
     context_window: int | None = None  # provider's known max, if any
+    # Prompt-cache telemetry (see TurnMetrics) — 0 when unreported.
+    cached_input_tokens: int = 0
+    cache_write_tokens: int = 0
 
 
 @dataclass
@@ -358,13 +374,21 @@ def message_to_row(msg: Message) -> tuple[str, dict[str, Any]]:
             "size": msg.size,
         }
     if isinstance(msg, SessionContext):
-        return "session_context", {"text": msg.text}
+        body: dict[str, Any] = {"text": msg.text}
+        if msg.name:
+            body["name"] = msg.name
+        return "session_context", body
     if isinstance(msg, TurnMetrics):
-        return "turn_metrics", {
+        body: dict[str, Any] = {
             "input_tokens": msg.input_tokens,
             "output_tokens": msg.output_tokens,
             "model": msg.model,
         }
+        if msg.cached_input_tokens:
+            body["cached_input_tokens"] = msg.cached_input_tokens
+        if msg.cache_write_tokens:
+            body["cache_write_tokens"] = msg.cache_write_tokens
+        return "turn_metrics", body
     if isinstance(msg, RunError):
         return "run_error", {"code": msg.code, "message": msg.message}
     if isinstance(msg, CompactionSummary):
@@ -416,12 +440,14 @@ def message_from_row(role: str, content: dict[str, Any]) -> Message:
             size=content.get("size", 0),
         )
     if role == "session_context":
-        return SessionContext(text=content["text"])
+        return SessionContext(text=content["text"], name=content.get("name"))
     if role == "turn_metrics":
         return TurnMetrics(
             input_tokens=int(content.get("input_tokens", 0)),
             output_tokens=int(content.get("output_tokens", 0)),
             model=content.get("model", ""),
+            cached_input_tokens=int(content.get("cached_input_tokens", 0)),
+            cache_write_tokens=int(content.get("cache_write_tokens", 0)),
         )
     if role == "run_error":
         return RunError(code=content.get("code", "other"), message=content.get("message", ""))

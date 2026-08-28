@@ -54,6 +54,7 @@ class Provider(Protocol):
         messages: list[Message],
         tools: list[ToolSchema],
         max_tokens: int = 4096,
+        prompt_caching: bool = False,
     ) -> AsyncIterator[ProviderEvent]: ...
 
 
@@ -77,12 +78,23 @@ class AnthropicProvider:
         messages: list[Message],
         tools: list[ToolSchema],
         max_tokens: int = 4096,
+        prompt_caching: bool = False,
     ) -> AsyncIterator[ProviderEvent]:
         api_messages = to_anthropic_messages(messages)
         api_tools = [to_anthropic_tool(t) for t in tools]
+        api_system: Any = system
+        if prompt_caching:
+            # cache_control on the stable prefix (system) + the tail markers
+            # (last user-text block, last block) — the Anthropic recipe for
+            # a conversation whose prefix repeats every call.
+            api_system = [
+                {"type": "text", "text": system,
+                 "cache_control": {"type": "ephemeral"}}
+            ]
+            _mark_anthropic_cache(api_messages)
         kwargs: dict[str, Any] = {
             "model": model,
-            "system": system,
+            "system": api_system,
             "messages": api_messages,
             "max_tokens": max_tokens,
         }
@@ -105,6 +117,8 @@ class _State:
         "stop_reason",
         "input_tokens",
         "output_tokens",
+        "cached_input_tokens",
+        "cache_write_tokens",
     )
 
     def __init__(self) -> None:
@@ -116,6 +130,44 @@ class _State:
         self.stop_reason: str | None = None
         self.input_tokens: int = 0
         self.output_tokens: int = 0
+        self.cached_input_tokens: int = 0
+        self.cache_write_tokens: int = 0
+
+
+def _blockify(content: Any) -> list[dict[str, Any]]:
+    """A message's content as a block list (cache_control needs blocks)."""
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    return list(content)
+
+
+def _mark_anthropic_cache(api_messages: list[dict[str, Any]]) -> None:
+    """cache_control markers on the tail: the last user-TEXT block and the
+    last block overall — with the system marker, the whole repeated prefix
+    is cacheable and only the newest turn misses."""
+    if not api_messages:
+        return
+    last_user_text = None
+    for msg in reversed(api_messages):
+        if msg.get("role") != "user":
+            continue
+        blocks = _blockify(msg["content"])
+        for block in reversed(blocks):
+            if isinstance(block, dict) and block.get("type") == "text":
+                last_user_text = (msg, blocks, block)
+                break
+        if last_user_text:
+            break
+    if last_user_text:
+        msg, blocks, block = last_user_text
+        block["cache_control"] = {"type": "ephemeral"}
+        msg["content"] = blocks
+    last = api_messages[-1]
+    blocks = _blockify(last["content"])
+    tail = blocks[-1]
+    if isinstance(tail, dict) and "cache_control" not in tail:
+        tail["cache_control"] = {"type": "ephemeral"}
+    last["content"] = blocks
 
 
 def to_anthropic_messages(messages: list[Message]) -> list[dict[str, Any]]:
@@ -204,7 +256,14 @@ def _translate(event: Any, state: _State, model: str = "") -> Iterable[ProviderE
         msg = getattr(event, "message", None)
         usage = getattr(msg, "usage", None) if msg is not None else None
         if usage is not None:
-            state.input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+            uncached = int(getattr(usage, "input_tokens", 0) or 0)
+            cached = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+            written = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+            # Normalize input_tokens to the TOTAL prompt — Anthropic's raw
+            # field excludes cached/creation tokens when caching is on.
+            state.input_tokens = uncached + cached + written
+            state.cached_input_tokens = cached
+            state.cache_write_tokens = written
             state.output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
     elif et == "content_block_start":
         cb = getattr(event, "content_block", None)
@@ -267,6 +326,8 @@ def _translate(event: Any, state: _State, model: str = "") -> Iterable[ProviderE
             input_tokens=state.input_tokens,
             output_tokens=state.output_tokens,
             model=model,
+            cached_input_tokens=state.cached_input_tokens,
+            cache_write_tokens=state.cache_write_tokens,
         )
         yield AssistantTurnEnd(text=state.text_buf, stop_reason=state.stop_reason)
         state.text_buf = ""
@@ -295,8 +356,11 @@ class OpenAIProvider:
         messages: list[Message],
         tools: list[ToolSchema],
         max_tokens: int = 4096,
+        prompt_caching: bool = False,
     ) -> AsyncIterator[ProviderEvent]:
-        api_messages = to_openai_messages(system, messages)
+        api_messages = self._prepare_messages(
+            system, messages, model=model, prompt_caching=prompt_caching
+        )
         api_tools = [to_openai_tool(t) for t in tools] or None
         # `max_completion_tokens` is the modern field; reasoning models (gpt-5, o1,
         # o3) reject `max_tokens` outright. Older models accept both.
@@ -315,6 +379,15 @@ class OpenAIProvider:
             yield evt
 
 
+    def _prepare_messages(
+        self, system: str, messages: list[Message], *, model: str,
+        prompt_caching: bool,
+    ) -> list[dict[str, Any]]:
+        # Base OpenAI: providers cache implicitly (prompt_tokens_details
+        # reports the hits) — no request-side markers exist.
+        return to_openai_messages(system, messages)
+
+
 class OpenRouterProvider(OpenAIProvider):
     """OpenRouter via the OpenAI-compatible chat completions API.
 
@@ -327,6 +400,47 @@ class OpenRouterProvider(OpenAIProvider):
 
     def __init__(self, api_key: str, base_url: str | None = None) -> None:
         super().__init__(api_key=api_key, base_url=base_url or self.DEFAULT_BASE_URL)
+
+    def _prepare_messages(
+        self, system: str, messages: list[Message], *, model: str,
+        prompt_caching: bool,
+    ) -> list[dict[str, Any]]:
+        api_messages = to_openai_messages(system, messages)
+        # Anthropic models behind OpenRouter take the SAME cache_control
+        # markers, carried as multipart content. Never for other sources
+        # (moonshotai/* et al. reject or ignore unknown part keys — and
+        # Moonshot's caching is implicit anyway).
+        if prompt_caching and model.startswith("anthropic/"):
+            _mark_openrouter_cache(api_messages)
+        return api_messages
+
+
+def _mark_openrouter_cache(api_messages: list[dict[str, Any]]) -> None:
+    """cache_control on the system part + the last user text part —
+    OpenRouter forwards the markers to Anthropic when content is multipart."""
+
+    def to_parts(msg: dict[str, Any]) -> list[dict[str, Any]]:
+        content = msg["content"]
+        if isinstance(content, str):
+            return [{"type": "text", "text": content}]
+        return list(content)
+
+    for msg in api_messages:
+        if msg.get("role") == "system":
+            parts = to_parts(msg)
+            if parts and isinstance(parts[-1], dict):
+                parts[-1]["cache_control"] = {"type": "ephemeral"}
+            msg["content"] = parts
+            break
+    for msg in reversed(api_messages):
+        if msg.get("role") == "user" and isinstance(msg.get("content"), (str, list)):
+            parts = to_parts(msg)
+            for part in reversed(parts):
+                if isinstance(part, dict) and part.get("type") == "text":
+                    part["cache_control"] = {"type": "ephemeral"}
+                    break
+            msg["content"] = parts
+            break
 
 
 def to_openai_messages(system: str, messages: list[Message]) -> list[dict[str, Any]]:
@@ -409,6 +523,8 @@ async def _translate_openai_stream(stream, model: str = "") -> AsyncIterator[Pro
     stop_reason: str | None = None
     input_tokens = 0
     output_tokens = 0
+    cached_input_tokens = 0
+    cache_write_tokens = 0
     # index -> {id, name, args}
     tool_calls: dict[int, dict[str, Any]] = {}
 
@@ -418,6 +534,15 @@ async def _translate_openai_stream(stream, model: str = "") -> AsyncIterator[Pro
         if usage is not None:
             input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
             output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+            # OpenAI-compatible cache telemetry: prompt_tokens is already
+            # the TOTAL; details name the cached share. OpenRouter forwards
+            # Anthropic's cache_creation as an extra field when present.
+            details = getattr(usage, "prompt_tokens_details", None)
+            if details is not None:
+                cached_input_tokens = int(getattr(details, "cached_tokens", 0) or 0)
+            cache_write_tokens = int(
+                getattr(usage, "cache_creation_input_tokens", 0) or 0
+            )
         if not chunk.choices:
             continue
         choice = chunk.choices[0]
@@ -453,7 +578,9 @@ async def _translate_openai_stream(stream, model: str = "") -> AsyncIterator[Pro
             input=parsed,
         )
     yield TurnUsageEvent(
-        input_tokens=input_tokens, output_tokens=output_tokens, model=model
+        input_tokens=input_tokens, output_tokens=output_tokens, model=model,
+        cached_input_tokens=cached_input_tokens,
+        cache_write_tokens=cache_write_tokens,
     )
     yield AssistantTurnEnd(text=text_buf, stop_reason=stop_reason)
 
@@ -489,6 +616,7 @@ class GoogleProvider:
         messages: list[Message],
         tools: list[ToolSchema],
         max_tokens: int = 4096,
+        prompt_caching: bool = False,  # Google caches implicitly; reported only
     ) -> AsyncIterator[ProviderEvent]:
         contents = to_google_contents(messages)
         config_kwargs: dict[str, Any] = {
@@ -628,11 +756,16 @@ async def _translate_google_stream(stream, model: str = "") -> AsyncIterator[Pro
     call_counter = 0
     input_tokens = 0
     output_tokens = 0
+    cached_input_tokens = 0
+    cache_write_tokens = 0  # Google reports reads only; writes stay 0
     async for chunk in stream:
         um = getattr(chunk, "usage_metadata", None)
         if um is not None:
             input_tokens = int(getattr(um, "prompt_token_count", 0) or 0)
             output_tokens = int(getattr(um, "candidates_token_count", 0) or 0)
+            cached_input_tokens = int(
+                getattr(um, "cached_content_token_count", 0) or 0
+            )
         candidates = getattr(chunk, "candidates", None) or []
         if not candidates:
             continue
@@ -665,7 +798,9 @@ async def _translate_google_stream(stream, model: str = "") -> AsyncIterator[Pro
         if fr is not None:
             stop_reason = _finish_reason_to_str(fr)
     yield TurnUsageEvent(
-        input_tokens=input_tokens, output_tokens=output_tokens, model=model
+        input_tokens=input_tokens, output_tokens=output_tokens, model=model,
+        cached_input_tokens=cached_input_tokens,
+        cache_write_tokens=cache_write_tokens,
     )
     yield AssistantTurnEnd(text=text_buf, stop_reason=stop_reason)
 

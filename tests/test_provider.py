@@ -197,3 +197,65 @@ def test_translate_emits_usage_event_with_token_counts():
     assert usage[0].input_tokens == 420
     assert usage[0].output_tokens == 7
     assert usage[0].model == "claude-sonnet-4-6"
+
+
+def test_translate_normalizes_cached_usage_to_total_prompt():
+    """mine-capstone#697: with caching on, Anthropic's raw input_tokens
+    excludes cached/creation tokens — the event reports the TOTAL plus the
+    cache split."""
+    from ark.types import TurnUsageEvent
+
+    events = [
+        evt(type="message_start", message=evt(usage=evt(
+            input_tokens=200, output_tokens=0,
+            cache_read_input_tokens=4_000, cache_creation_input_tokens=800,
+        ))),
+        evt(type="message_delta", delta=evt(stop_reason="end_turn"),
+            usage=evt(output_tokens=7)),
+        evt(type="message_stop"),
+    ]
+    out = list(translate_stream(events, model="claude-sonnet-4-6"))
+    (usage,) = [e for e in out if isinstance(e, TurnUsageEvent)]
+    assert usage.input_tokens == 5_000  # total prompt
+    assert usage.cached_input_tokens == 4_000
+    assert usage.cache_write_tokens == 800
+
+
+def test_mark_anthropic_cache_targets_system_and_tail():
+    from ark.provider import _mark_anthropic_cache
+
+    api_messages = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": [{"type": "text", "text": "answer"}]},
+        {"role": "user", "content": "second question"},
+    ]
+    _mark_anthropic_cache(api_messages)
+    # Last user-text block (also the last block here) carries the marker.
+    last = api_messages[-1]
+    assert isinstance(last["content"], list)
+    assert last["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    # Earlier messages untouched.
+    assert api_messages[0]["content"] == "first question"
+
+
+def test_mark_openrouter_cache_only_for_anthropic_models():
+    from ark.provider import OpenRouterProvider
+    from ark.types import UserText
+
+    provider = OpenRouterProvider.__new__(OpenRouterProvider)
+    marked = provider._prepare_messages(
+        "SYSTEM", [UserText(text="q")], model="anthropic/claude-sonnet-4-6",
+        prompt_caching=True,
+    )
+    system = marked[0]
+    assert isinstance(system["content"], list)
+    assert system["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    user = marked[-1]
+    assert user["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    # moonshotai/* (and everything non-Anthropic) stays plain strings.
+    plain = provider._prepare_messages(
+        "SYSTEM", [UserText(text="q")], model="moonshotai/kimi-k3",
+        prompt_caching=True,
+    )
+    assert plain[0]["content"] == "SYSTEM"
+    assert plain[-1]["content"] == "q"

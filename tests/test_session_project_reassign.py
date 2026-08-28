@@ -369,7 +369,7 @@ async def test_llm_sees_synthetic_notification_and_new_project_in_sys_prompt(
     class _StubProvider:
         def __init__(self):
             self.calls = []
-        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096):
+        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096, prompt_caching=False):
             self.calls.append({"system": system, "messages": list(messages)})
             yield TextDelta(text="ack")
             yield AssistantTurnEnd(text="ack", stop_reason="end")

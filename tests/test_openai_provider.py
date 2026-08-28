@@ -173,3 +173,34 @@ async def test_translate_text_and_tool_call_stream():
     assert usage[0].input_tokens == 42
     assert usage[0].output_tokens == 7
     assert usage[0].model == "gpt-5"
+
+
+def test_usage_chunk_cached_details_parsed():
+    """mine-capstone#697: prompt_tokens is already the total; the details
+    name the cached share (and OpenRouter forwards cache_creation)."""
+    import asyncio
+
+    from ark.provider import _translate_openai_stream
+    from ark.types import TurnUsageEvent
+
+    ns = SimpleNamespace
+
+    async def stream():
+        yield ns(choices=[ns(delta=ns(content="ok", tool_calls=None), finish_reason="stop")], usage=None)
+        yield ns(
+            choices=[],
+            usage=ns(
+                prompt_tokens=5_000, completion_tokens=9,
+                prompt_tokens_details=ns(cached_tokens=4_200),
+                cache_creation_input_tokens=300,
+            ),
+        )
+
+    async def run():
+        return [e async for e in _translate_openai_stream(stream(), model="anthropic/claude-sonnet-4-6")]
+
+    out = asyncio.run(run())
+    (usage,) = [e for e in out if isinstance(e, TurnUsageEvent)]
+    assert usage.input_tokens == 5_000
+    assert usage.cached_input_tokens == 4_200
+    assert usage.cache_write_tokens == 300

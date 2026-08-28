@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased — Context efficiency: named context blocks, tool-result elision, prompt caching, /context endpoint
+
+Four related changes that stop a long session's prompt from growing
+without bound and make its cost observable:
+
+- **Named context blocks.** `POST /agents/{name}/sessions/{sid}/context`
+  accepts an optional `name`; appending the same name again REPLACES the
+  block in the system prompt (last text, first position) instead of
+  growing it forever. Unnamed appends keep the additive behavior. The
+  response gains `replaced: true|false`. Rows are append-only — the
+  dedupe happens at prompt-build time.
+- **Tool-result elision (in-memory).** Once the in-view tool-result bytes
+  exceed `tool_result_max_bytes` (default 64 KB), ONE pass replaces
+  results older than the last `tool_result_keep_turns` (2) user turns and
+  larger than `tool_result_elide_over` (2 KB) with a short stub naming
+  the tool and call id. Hysteresis by design — a per-turn trim would bust
+  the provider prompt cache. Rows are never touched.
+- **Prompt caching + cache telemetry.** `agents.<name>.prompt_caching`
+  (default true) adds `cache_control` markers on Anthropic (native and
+  `anthropic/*` via OpenRouter). `TurnMetrics`/`turn_usage` gain
+  `cached_input_tokens` / `cache_write_tokens`, with `input_tokens`
+  normalized to the TOTAL prompt on every provider path
+  (OpenAI-compatible `prompt_tokens_details.cached_tokens`, Google
+  `cached_content_token_count`). The CLI usage line shows `% cached`.
+- **`GET /agents/{name}/sessions/{sid}/context`** reports the live system
+  prompt size, every context block (named blocks deduped exactly as
+  rendered), the latest usage numbers and the compaction count.
+
+New agent config knobs: `prompt_caching`, `tool_result_keep_turns`,
+`tool_result_elide_over`, `tool_result_max_bytes`. `ark/models.py` adds
+the `kimi-k3` context window (256k).
+
+
 ## Unreleased — Cron entries can be bound to a project
 
 A cron entry can now carry an optional `project_id`. Every fire of that

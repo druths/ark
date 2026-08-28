@@ -59,7 +59,7 @@ class _ScriptedProvider:
         self._scripts = list(scripts)
         self.calls = []
 
-    async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096):
+    async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096, prompt_caching=False):
         self.calls.append({"system": system, "messages": list(messages)})
         script = self._scripts.pop(0)
         for evt in script:
