@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased — Richer error messages
+
+Provider errors surfaced on `/events` and persisted as `RunError` rows
+now include the exception class name and (when the SDK exposes them) the
+HTTP status code and request id. A bare `"Internal Server Error"` from a
+provider 5xx now becomes `"InternalServerError [status=500]: Internal
+Server Error (request_id=req_abc123)"` — enough context to open a
+support ticket without digging in the logs.
+
+Extraction is duck-typed (`status_code`, `request_id`,
+`response.headers['x-request-id']` / `request-id` /
+`x-anthropic-request-id`) so the runtime doesn't couple to any
+provider-SDK version.
+
+Full tracebacks are also logged to stderr on every classified error and
+on any unhandled exception that escapes `run_user_turn` — grep
+`docker compose logs ark` for the session id to find the stack.
+
+Applies uniformly to:
+- Turn errors in `run_user_turn` (persisted as `RunError`, emitted as
+  `error` event).
+- Compaction failures in `compact_session` (emitted as
+  `compaction_failed` event).
+- Unhandled escapes in `run_and_publish` (bare `error` event on the
+  broker).
+
+No wire-format change — the `message` field just carries more useful
+text. Existing clients see the same shape.
+
 ## Unreleased — Turn token budget replaces max_iterations
 
 The hardcoded 16-iteration cap on `run_user_turn`'s model→tools loop is

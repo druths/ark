@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 import time
 import uuid
 from typing import AsyncIterator
@@ -336,11 +337,19 @@ def classify_provider_error(exc: Exception) -> tuple[str, str]:
     intentionally loose — uses both exception class name and message text so
     it works across Anthropic, OpenAI, OpenRouter (OpenAI-shaped), and Google
     without coupling to their import paths.
+
+    The returned message always carries the exception class name plus any
+    structured detail the SDK exposes (status code, request id). Without
+    this, a bare provider 5xx surfaces as "Internal Server Error" with no
+    breadcrumbs; with it, the same error becomes
+    "APIStatusError [status=500]: Internal Server Error (request_id=req_...)".
     """
 
     name = type(exc).__name__
     raw = str(exc)
     low = raw.lower()
+    message = _format_provider_error_message(exc, name, raw)
+
     context_hits = (
         "context_length_exceeded",
         "context length",
@@ -352,9 +361,9 @@ def classify_provider_error(exc: Exception) -> tuple[str, str]:
         "maximum context length",
     )
     if any(k in low for k in context_hits):
-        return "context_too_long", raw
+        return "context_too_long", message
     if "RateLimit" in name or "rate limit" in low or "rate_limit" in low or "429" in raw:
-        return "rate_limit", raw
+        return "rate_limit", message
     if (
         "Authentication" in name
         or "Unauthorized" in name
@@ -362,8 +371,54 @@ def classify_provider_error(exc: Exception) -> tuple[str, str]:
         or "invalid api key" in low
         or "invalid_api_key" in low
     ):
-        return "auth", raw
-    return "other", raw
+        return "auth", message
+    return "other", message
+
+
+def _format_provider_error_message(exc: Exception, name: str, raw: str) -> str:
+    """Enrich a provider exception with structured detail via duck typing.
+
+    We don't want to import anthropic/openai/google-genai exception classes
+    here — that would couple the runtime to specific SDK versions. Instead
+    we look for common attributes on the exception object (`status_code`,
+    `request_id`, `response.headers`) that those SDKs happen to expose,
+    and include whatever's present.
+    """
+    status_code = getattr(exc, "status_code", None)
+    request_id = getattr(exc, "request_id", None)
+    if not request_id:
+        response = getattr(exc, "response", None)
+        if response is not None:
+            try:
+                headers = getattr(response, "headers", None) or {}
+                # OpenAI and Anthropic both use `x-request-id`; some
+                # gateways use bare `request-id`.
+                request_id = (
+                    headers.get("x-request-id")
+                    or headers.get("request-id")
+                    or headers.get("x-anthropic-request-id")
+                )
+            except Exception:  # noqa: BLE001
+                request_id = None
+
+    prefix = name
+    if status_code is not None:
+        prefix += f" [status={status_code}]"
+    out = f"{prefix}: {raw}" if raw else prefix
+    if request_id:
+        out += f" (request_id={request_id})"
+    return out
+
+
+def _log_error_traceback(prefix: str) -> None:
+    """Log the current exception's traceback to stderr with a session-scoped
+    prefix. Called from error-handling branches so an operator running
+    `docker compose logs ark | grep <session-id>` can find the whole stack
+    even when the wire message is thin."""
+    import traceback
+
+    print(prefix, file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +639,9 @@ async def compact_session(
             # perspective.
     except Exception as exc:  # noqa: BLE001
         code, message = classify_provider_error(exc)
+        _log_error_traceback(
+            f"[runtime] compaction failed for session {session_id} (code={code}, reason={reason}):"
+        )
         yield CompactionFailedEvent(code=code, message=message, reason=reason)
         return
 
@@ -789,6 +847,9 @@ async def run_user_turn(
                     append_message(conn, session_id, UserText(text=user_text))
                     if success:
                         continue  # retry this iteration with compacted history
+            _log_error_traceback(
+                f"[runtime] turn error in session {session_id} (code={code}):"
+            )
             append_message(conn, session_id, RunError(code=code, message=message))
             yield RunErrorEvent(code=code, message=message)
             yield RunEnd(stop_reason=f"error:{code}")
@@ -943,6 +1004,9 @@ async def run_and_publish(
     except Exception as e:  # noqa: BLE001
         # run_user_turn catches provider exceptions itself; this is for anything
         # that escapes (programming errors, broker failures, etc.).
+        _log_error_traceback(
+            f"[runtime] unhandled error in run_and_publish for session {session_id}:"
+        )
         broker.publish(
             session_id,
             {
@@ -950,6 +1014,6 @@ async def run_and_publish(
                 "session_id": session_id,
                 "agent_name": agent.name,
                 "code": "other",
-                "message": f"{type(e).__name__}: {e}",
+                "message": _format_provider_error_message(e, type(e).__name__, str(e)),
             },
         )

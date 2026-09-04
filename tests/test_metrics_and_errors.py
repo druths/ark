@@ -101,6 +101,87 @@ def test_classify_other_fallback():
 
 
 # ---------------------------------------------------------------------------
+# Message enrichment: class name + status_code + request_id
+# ---------------------------------------------------------------------------
+
+
+def test_classify_prepends_exception_class_name():
+    """Even for the "other" bucket, the class name should carry through so
+    a bare 'Internal Server Error' becomes 'InternalServerError: Internal
+    Server Error' — enough to tell it's a provider 5xx vs. a local bug."""
+
+    class InternalServerError(Exception):
+        pass
+
+    code, msg = classify_provider_error(InternalServerError("Internal Server Error"))
+    assert code == "other"
+    assert msg.startswith("InternalServerError:")
+    assert "Internal Server Error" in msg
+
+
+def test_classify_includes_status_code_when_present():
+    """SDK exceptions like anthropic.APIStatusError expose .status_code —
+    include it so operators can distinguish a 500 from a 502 without a stack."""
+
+    class APIStatusError(Exception):
+        def __init__(self, message, status_code):
+            super().__init__(message)
+            self.status_code = status_code
+
+    _, msg = classify_provider_error(APIStatusError("boom", 500))
+    assert "[status=500]" in msg
+    assert "boom" in msg
+
+
+def test_classify_includes_request_id_when_present():
+    """Direct .request_id attribute (OpenAI/Anthropic SDKs) is surfaced."""
+
+    class APIError(Exception):
+        pass
+
+    exc = APIError("bad happened")
+    exc.request_id = "req_abc123"
+    _, msg = classify_provider_error(exc)
+    assert msg.endswith("(request_id=req_abc123)")
+
+
+def test_classify_extracts_request_id_from_response_headers():
+    """When request_id isn't a direct attribute, fall back to response
+    headers — where Anthropic and OpenAI actually stash it on their
+    APIStatusError.response objects."""
+
+    class _Response:
+        headers = {"x-request-id": "req_headerish"}
+
+    class APIStatusError(Exception):
+        def __init__(self, msg):
+            super().__init__(msg)
+            self.status_code = 502
+            self.response = _Response()
+
+    _, msg = classify_provider_error(APIStatusError("upstream 502"))
+    assert "[status=502]" in msg
+    assert "(request_id=req_headerish)" in msg
+
+
+def test_classify_no_request_id_no_status_still_carries_class():
+    """Baseline: even with a plain Exception the message includes the class."""
+    _, msg = classify_provider_error(Exception("boring failure"))
+    assert msg.startswith("Exception: boring failure")
+
+
+def test_classify_empty_message_still_useful():
+    """Some providers raise with no message body — the class name alone
+    is still better than the pre-enrichment blank."""
+
+    class TimeoutError(Exception):  # noqa: A001
+        pass
+
+    _, msg = classify_provider_error(TimeoutError())
+    assert msg == "TimeoutError"
+
+
+# ---------------------------------------------------------------------------
 # Runtime: usage is persisted, errors are caught + persisted, both filtered
 # from the LLM message list on subsequent iterations.
 # ---------------------------------------------------------------------------

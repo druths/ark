@@ -293,6 +293,18 @@ session is not deleted — history is fully readable and you can attempt
 another turn (which will likely hit the same problem until you act on the
 code).
 
+**Error message enrichment.** For every classified code, the `message`
+field carries the exception's class name and — when the SDK exposes them
+— a status code and request id. So a bare provider 5xx that would
+otherwise surface as just `"Internal Server Error"` becomes something
+like `"InternalServerError [status=500]: Internal Server Error
+(request_id=req_abc123)"`. This is done via duck-typed attribute lookup
+(`status_code`, `request_id`, `response.headers['x-request-id']`), no
+SDK imports — works uniformly across Anthropic, OpenAI, OpenRouter, and
+Google. Full tracebacks are also logged to stderr on every classified
+error so `docker compose logs ark | grep <session-id>` gives operators
+the whole stack even when the wire message is thin.
+
 ## Turn token budget
 
 Every turn has a cumulative token budget — input+output summed across the
