@@ -66,6 +66,10 @@ class AgentConfig:
     # Automatic session compaction — see docs/sessions.md.
     compaction_enabled: bool = True
     compaction_threshold: float = 0.85  # fraction of context_window that triggers
+    # Per-agent override for the per-turn cumulative token budget (input +
+    # output summed across iterations). Null → runtime.DEFAULT_TURN_TOKEN_BUDGET.
+    # Per-cron entries can further override this via crons.max_tokens.
+    max_turn_tokens: int | None = None
 
 
 @dataclass
@@ -263,6 +267,13 @@ def _agents(
             raise ConfigError(
                 f"agents.{name}.compaction_threshold must be a number strictly between 0 and 1"
             )
+        max_turn_tokens = cfg.get("max_turn_tokens")
+        if max_turn_tokens is not None and (
+            not isinstance(max_turn_tokens, int) or max_turn_tokens <= 0
+        ):
+            raise ConfigError(
+                f"agents.{name}.max_turn_tokens must be a positive integer if set"
+            )
         out[name] = AgentConfig(
             name=name,
             provider=provider,
@@ -274,5 +285,6 @@ def _agents(
             always_loaded_mcp_servers=list(always_mcp),
             compaction_enabled=compaction_enabled,
             compaction_threshold=float(compaction_threshold),
+            max_turn_tokens=max_turn_tokens,
         )
     return out

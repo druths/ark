@@ -88,7 +88,8 @@ def create_app(config: Config) -> FastAPI:
             "SELECT heartbeat_seconds FROM agent_state WHERE agent_name = ?", (name,)
         ).fetchone()
         crons = conn.execute(
-            "SELECT id, expr, prompt, project_id FROM crons WHERE agent_name = ? AND enabled = 1",
+            "SELECT id, expr, prompt, project_id, max_tokens "
+            "FROM crons WHERE agent_name = ? AND enabled = 1",
             (name,),
         ).fetchall()
         mcp_manager = mcp.get_manager()
@@ -205,7 +206,7 @@ def create_app(config: Config) -> FastAPI:
         if name not in config.agents:
             raise HTTPException(404, "unknown agent")
         rows = conn.execute(
-            "SELECT id, expr, prompt, enabled, project_id "
+            "SELECT id, expr, prompt, enabled, project_id, max_tokens "
             "FROM crons WHERE agent_name = ? ORDER BY id",
             (name,),
         ).fetchall()
@@ -246,23 +247,36 @@ def create_app(config: Config) -> FastAPI:
             p = projects.get(conn, project_id)
             if p is None or p.deleted_at is not None:
                 raise HTTPException(404, "unknown project")
+
+        # `max_tokens` is optional; same shape as project_id. Present + null
+        # explicitly reverts to "use agent/global default"; omitted preserves.
+        max_tokens_present = "max_tokens" in body
+        max_tokens = body.get("max_tokens")
+        if max_tokens_present and max_tokens is not None:
+            if not isinstance(max_tokens, int) or max_tokens <= 0:
+                raise HTTPException(
+                    400, "'max_tokens' must be a positive integer or null"
+                )
+
+        # Build the SET clause dynamically so unspecified fields are preserved
+        # on upsert. Base fields (expr, prompt, enabled) always update.
+        set_clauses = ["expr=excluded.expr", "prompt=excluded.prompt", "enabled=1"]
+        insert_cols = ["agent_name", "id", "expr", "prompt", "enabled"]
+        insert_vals: list = [name, cron_id, expr, prompt, 1]
         if project_id_present:
-            conn.execute(
-                "INSERT INTO crons(agent_name, id, expr, prompt, enabled, project_id) "
-                "VALUES (?,?,?,?,1,?) "
-                "ON CONFLICT(agent_name, id) DO UPDATE SET "
-                "expr=excluded.expr, prompt=excluded.prompt, enabled=1, "
-                "project_id=excluded.project_id",
-                (name, cron_id, expr, prompt, project_id),
-            )
-        else:
-            # Omitted → don't touch project_id on existing rows; keep null on new.
-            conn.execute(
-                "INSERT INTO crons(agent_name, id, expr, prompt, enabled) VALUES (?,?,?,?,1) "
-                "ON CONFLICT(agent_name, id) DO UPDATE SET "
-                "expr=excluded.expr, prompt=excluded.prompt, enabled=1",
-                (name, cron_id, expr, prompt),
-            )
+            set_clauses.append("project_id=excluded.project_id")
+            insert_cols.append("project_id")
+            insert_vals.append(project_id)
+        if max_tokens_present:
+            set_clauses.append("max_tokens=excluded.max_tokens")
+            insert_cols.append("max_tokens")
+            insert_vals.append(max_tokens)
+        placeholders = ",".join(["?"] * len(insert_vals))
+        sql = (
+            f"INSERT INTO crons({','.join(insert_cols)}) VALUES ({placeholders}) "
+            f"ON CONFLICT(agent_name, id) DO UPDATE SET {', '.join(set_clauses)}"
+        )
+        conn.execute(sql, insert_vals)
         return {"ok": True}
 
     @app.delete("/agents/{name}/crons/{cron_id}")

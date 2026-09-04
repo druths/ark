@@ -1,5 +1,86 @@
 # Changelog
 
+## Unreleased — Turn token budget replaces max_iterations
+
+The hardcoded 16-iteration cap on `run_user_turn`'s model→tools loop is
+gone. Turns now terminate on a **cumulative token budget** — input+output
+summed across iterations of the current turn. This unblocks legitimate
+long-running work (e.g. a cron doing many small tool calls) while still
+catching genuine runaway. See
+[docs/sessions.md § Turn token budget](docs/sessions.md#turn-token-budget).
+
+### Precedence
+
+Highest wins:
+
+1. Explicit `max_tokens` arg to `run_user_turn` / `run_and_publish` —
+   the scheduler passes `crons.max_tokens` here.
+2. `AgentConfig.max_turn_tokens` — per-agent override in config.
+3. `runtime.DEFAULT_TURN_TOKEN_BUDGET` — currently `500_000`. Generous
+   by design; ordinary turns run 5–25k total.
+
+### Schema migration v6
+
+Adds `crons.max_tokens INTEGER` (nullable). Existing crons keep firing
+at whatever the agent/global default is unchanged.
+
+### Config
+
+Per-agent, optional, positive integer:
+
+```json
+"agents": {
+  "scribe": { ..., "max_turn_tokens": 2000000 }
+}
+```
+
+Existing configs pick up the default without change.
+
+### REST + tool + CLI additions
+
+- `PUT /agents/{name}/crons/{cron_id}` now accepts optional
+  `max_tokens: int | null`. Same "omit = preserve, null = clear"
+  semantics as `project_id`. `GET .../crons` returns it.
+- `add_cron(id, expr, prompt, project_id?, max_tokens?)` — new optional
+  parameter, validated at add time.
+- `list_crons` output shows `[max_tokens=N]` next to each cron that has
+  an override.
+- `ark cron set --max-tokens N` / `--no-max-tokens` — mutually exclusive
+  with each other; omitting both preserves the existing setting.
+
+### New error code
+
+`token_budget_exceeded` joins `context_too_long`, `rate_limit`, `auth`,
+`other`. Persisted as `RunError`, emitted as `error` event, terminates
+the turn with `stop_reason: "error:token_budget_exceeded"`. The message
+includes both the actual cumulative count and the effective budget so
+operators can decide whether to bump the cap or fix the workflow.
+
+### Sharp edges
+
+- **Check is post-iteration.** The budget is verified between iterations,
+  so a single iteration that produces a huge response is recorded and
+  counted, then the next iteration doesn't happen. We don't preemptively
+  cancel a mid-stream generation.
+- **First iteration always runs**, no matter the budget — the check can't
+  fire until `TurnMetrics` lands.
+- **User turns are subject to the same budget.** The old 16-iteration
+  protection was a hard cap for user turns too; now they can spin up to
+  the token budget's limit before erroring. Ordinarily fine (500k default
+  is generous), worth noting because a broken user-triggered tool loop
+  could now run much longer before the safety net catches it.
+- **Compaction is excluded.** The summarizer call doesn't emit
+  `TurnMetrics`, so it doesn't count against the turn's budget.
+
+### Docs updates
+
+- [docs/sessions.md](docs/sessions.md) — new "Turn token budget" section;
+  error-code table adds `token_budget_exceeded`.
+- [docs/projects.md](docs/projects.md) — cron section updated to cover
+  `max_tokens`.
+- [docs/config.md](docs/config.md) — agent-field table adds
+  `max_turn_tokens`.
+
 ## Unreleased — Cron entries can be bound to a project
 
 A cron entry can now carry an optional `project_id`. Every fire of that

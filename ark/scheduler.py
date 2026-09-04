@@ -86,7 +86,8 @@ class Scheduler:
 
         # crons
         rows = self.conn.execute(
-            "SELECT agent_name, id, expr, prompt, project_id FROM crons WHERE enabled = 1"
+            "SELECT agent_name, id, expr, prompt, project_id, max_tokens "
+            "FROM crons WHERE enabled = 1"
         ).fetchall()
         now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
         for row in rows:
@@ -105,7 +106,8 @@ class Scheduler:
                 self.last_cron[key] = now
                 asyncio.create_task(
                     self._fire_cron(
-                        row["agent_name"], row["id"], row["prompt"], row["project_id"]
+                        row["agent_name"], row["id"], row["prompt"],
+                        row["project_id"], row["max_tokens"],
                     )
                 )
 
@@ -131,7 +133,8 @@ class Scheduler:
         await self._drive(agent_name, "heartbeat", prompt)
 
     async def _fire_cron(
-        self, agent_name: str, cron_id: str, prompt: str, project_id: str | None
+        self, agent_name: str, cron_id: str, prompt: str,
+        project_id: str | None, max_tokens: int | None = None,
     ) -> None:
         # If the cron was bound to a project that has since been soft-deleted,
         # warn but still fire — the session just runs project-less. Matches
@@ -150,7 +153,8 @@ class Scheduler:
                 # the cron was TRYING to bind to (audit). runtime.session_project
                 # returns None so the LLM view is project-less.
         await self._drive(
-            agent_name, "cron", prompt, cron_id=cron_id, project_id=project_id
+            agent_name, "cron", prompt,
+            cron_id=cron_id, project_id=project_id, max_tokens=max_tokens,
         )
 
     async def _drive(
@@ -160,6 +164,7 @@ class Scheduler:
         prompt: str,
         cron_id: str | None = None,
         project_id: str | None = None,
+        max_tokens: int | None = None,
     ) -> None:
         agent = self.config.agents.get(agent_name)
         if agent is None:
@@ -177,6 +182,7 @@ class Scheduler:
                 agent=agent,
                 session_id=sid,
                 user_text=prompt,
+                max_tokens=max_tokens,
             )
         except Exception as e:  # noqa: BLE001
             print(f"[scheduler] {kind} session {sid} error: {e}", file=sys.stderr)

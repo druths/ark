@@ -43,6 +43,14 @@ from .types import (
 )
 
 
+# Default per-turn cumulative token budget (input + output summed across
+# iterations of the model→tools loop). Replaces the old hardcoded
+# max_iterations=16 cap. Generous by design — ordinary turns run
+# 5–25k total; a runaway hitting 500k is almost certainly broken. Overrides:
+# AgentConfig.max_turn_tokens (per-agent) and crons.max_tokens (per-cron).
+DEFAULT_TURN_TOKEN_BUDGET = 500_000
+
+
 # ---------------------------------------------------------------------------
 # Provider construction
 # ---------------------------------------------------------------------------
@@ -605,9 +613,23 @@ async def run_user_turn(
     session_id: str,
     user_text: str,
     provider_factory=make_provider,
-    max_iterations: int = 16,
+    max_tokens: int | None = None,
 ) -> AsyncIterator[RuntimeEvent]:
-    """Persist the user message, then drive the model → tools → model loop."""
+    """Persist the user message, then drive the model → tools → model loop.
+
+    The loop terminates when either the model stops calling tools (natural end)
+    or when the cumulative token budget (input + output summed across
+    iterations of THIS turn — compaction is not counted) exceeds
+    `max_tokens`. Budget precedence: explicit arg > agent.max_turn_tokens
+    > DEFAULT_TURN_TOKEN_BUDGET.
+    """
+
+    # Resolve the effective budget once at turn start.
+    effective_budget = (
+        max_tokens
+        if max_tokens is not None
+        else (agent.max_turn_tokens if agent.max_turn_tokens is not None else DEFAULT_TURN_TOKEN_BUDGET)
+    )
 
     context_window = models.context_window_for(
         agent.model, agent.max_context_tokens
@@ -653,7 +675,8 @@ async def run_user_turn(
     project = session_project(conn, session_id)
 
     last_stop_reason: str | None = None
-    for _ in range(max_iterations):
+    tokens_used = 0  # cumulative input+output across THIS turn's iterations
+    while True:
         history = load_history(conn, session_id)
         # Slice for the LLM's message list at the latest CompactionSummary:
         # everything before it has been summarized and folded into the system
@@ -702,6 +725,7 @@ async def run_user_turn(
                             model=evt.model or agent.model,
                         ),
                     )
+                    tokens_used += evt.input_tokens + evt.output_tokens
                     # Re-emit with the agent's known context_window so the
                     # client can show a percentage.
                     yield TurnUsageEvent(
@@ -793,7 +817,21 @@ async def run_user_turn(
             )
             yield ToolResultEvent(call_id=tc.id, output=output, is_error=is_error)
 
-    yield RunEnd(stop_reason="max_iterations")
+        # Budget check between iterations. At least one iteration always runs
+        # (the check happens AFTER the first iteration's TurnMetrics lands);
+        # runaway loops are cut off at the boundary between iterations.
+        if tokens_used >= effective_budget:
+            message = (
+                f"turn used {tokens_used} cumulative input+output tokens; "
+                f"budget was {effective_budget}"
+            )
+            append_message(
+                conn, session_id,
+                RunError(code="token_budget_exceeded", message=message),
+            )
+            yield RunErrorEvent(code="token_budget_exceeded", message=message)
+            yield RunEnd(stop_reason="error:token_budget_exceeded")
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -875,6 +913,7 @@ async def run_and_publish(
     agent: AgentConfig,
     session_id: str,
     user_text: str,
+    max_tokens: int | None = None,
 ) -> None:
     """Drive a user turn and publish each event to the broker.
 
@@ -882,6 +921,10 @@ async def run_and_publish(
     (per-session or global) can route. Use this from any code path that wants
     a turn's events visible to connected clients — the unified WS handler,
     the scheduler, etc.
+
+    `max_tokens` overrides the per-turn token budget for this call. When None
+    (the default), the resolution falls back to agent.max_turn_tokens, then
+    DEFAULT_TURN_TOKEN_BUDGET.
     """
 
     try:
@@ -891,6 +934,7 @@ async def run_and_publish(
             agent=agent,
             session_id=session_id,
             user_text=user_text,
+            max_tokens=max_tokens,
         ):
             wire = event_to_wire(evt)
             wire["session_id"] = session_id

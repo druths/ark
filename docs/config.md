@@ -257,6 +257,7 @@ Each agent is keyed by name. The name is what you use everywhere — CLI
 | `always_loaded_mcp_servers` | string[] | no | Subset of `mcp_servers` whose tools are exposed on every turn without requiring the agent to call `load_skill` first. Mirrors `always_loaded_skills` for MCP-backed tools. |
 | `compaction_enabled` | bool | no | Turn automatic session compaction on/off. Default `true`. See [sessions.md § Compaction](sessions.md#compaction). |
 | `compaction_threshold` | number | no | Fraction of `context_window` (strictly between 0 and 1) that triggers proactive compaction. Default `0.85`. |
+| `max_turn_tokens` | int | no | Per-agent override for the per-turn cumulative token budget (input+output across iterations). Positive integer. Falls back to `runtime.DEFAULT_TURN_TOKEN_BUDGET` (currently 500k). Per-cron entries can further override this. See [sessions.md § Turn token budget](sessions.md#turn-token-budget). |
 
 Two files live alongside each agent's config — Ark creates them on
 `init` / `serve` if missing, and you edit them as part of agent design:

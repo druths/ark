@@ -276,21 +276,58 @@ recipe (start a new session) still applies.
 
 ## Error tracking
 
-Provider exceptions are caught inside `run_user_turn`, classified into one
-of four codes, persisted as a `RunError` message, and surfaced over the WS
-as an `error` event:
+Errors are caught inside `run_user_turn` — either classified provider
+exceptions or a budget breach raised by the runtime itself — persisted as
+a `RunError` message, and surfaced over the WS as an `error` event:
 
 | Code | Triggered by |
 |---|---|
 | `context_too_long` | "context length exceeded" / "prompt is too long" / "input is too long" from any provider |
 | `rate_limit` | 429s, "rate limit" in the message, or a `RateLimit*` exception type |
 | `auth` | 401s, "authentication" / "invalid api key" in the message, or `Authentication*` exception types |
+| `token_budget_exceeded` | Cumulative input+output tokens across this turn's iterations exceeded the effective budget. See [Turn token budget](#turn-token-budget) below. |
 | `other` | Anything else |
 
 After an error, the run loop ends with `stop_reason: "error:<code>"`. The
 session is not deleted — history is fully readable and you can attempt
 another turn (which will likely hit the same problem until you act on the
 code).
+
+## Turn token budget
+
+Every turn has a cumulative token budget — input+output summed across the
+iterations of the model→tools loop. When the budget is exceeded (checked
+between iterations, so at least one iteration always runs), the turn
+terminates with `error:token_budget_exceeded`. This replaces the old
+hardcoded 16-iteration cap; a runaway that produces small output per
+iteration will now spin much longer before the budget catches it, and a
+legitimate turn doing 30 small tool calls no longer dies at iteration 16.
+
+**Precedence** (highest wins):
+
+1. Explicit `max_tokens` arg to `run_user_turn` / `run_and_publish` — the
+   scheduler passes `crons.max_tokens` here.
+2. `AgentConfig.max_turn_tokens` — per-agent override in config.
+3. `runtime.DEFAULT_TURN_TOKEN_BUDGET` — currently `500_000`. Generous by
+   design — ordinary turns run 5–25k total.
+
+**Metric**: cumulative `input_tokens + output_tokens` from every
+`TurnMetrics` row written during this turn. Compaction's summarizer call
+does NOT emit `TurnMetrics` and is not counted toward the budget.
+
+**Config**:
+
+```json
+"agents": {
+  "scribe": {
+    ...
+    "max_turn_tokens": 2000000
+  }
+}
+```
+
+Positive integer or omit for the default. Per-cron override lives on the
+cron row itself — see [projects.md § Cron entries can be bound to a project](projects.md#cron-entries-can-be-bound-to-a-project).
 
 ## Compaction
 

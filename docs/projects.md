@@ -257,12 +257,27 @@ project's `uploads/`.
 
 ```
 PUT /agents/{name}/crons/{cron_id}
-Body: { "expr": "...", "prompt": "...", "project_id": "<uuid>" | null }
+Body: {
+  "expr": "...",
+  "prompt": "...",
+  "project_id"?: "<uuid>" | null,
+  "max_tokens"?: <positive int> | null
+}
 ```
 
-`project_id` is optional. When omitted on an update, the existing binding
-is preserved (so "just change the schedule" works). Explicit `null`
-detaches. Unknown or soft-deleted project → `404`.
+Both `project_id` and `max_tokens` are optional and use the same
+"omit = preserve, null = clear" semantics: omitting on update keeps the
+existing value; explicit `null` explicitly reverts (detaches the project /
+drops the per-cron budget override).
+
+- Unknown or soft-deleted project → `404`.
+- Non-positive-integer `max_tokens` → `400`.
+
+`max_tokens` sets a per-cron override for the per-turn token budget (see
+[sessions.md § Turn token budget](sessions.md#turn-token-budget)). Useful
+when a specific cron does heavier work than the agent's default budget
+allows, or when you want to cap a specific cron more tightly than the
+agent's default.
 
 `GET /agents/{name}/crons` returns `project_id` and `project_name` on each
 row. A cron whose bound project was soft-deleted returns `project_name:
@@ -271,12 +286,13 @@ null` (the id survives for audit).
 **Agent tool:**
 
 ```python
-add_cron(id, expr, prompt, project_id?)
+add_cron(id, expr, prompt, project_id?, max_tokens?)
 ```
 
 To discover a project's id, agents can call the new `list_projects` tool
 (active projects only), or `get_current_session_info` if their current
-session is already in the project they want.
+session is already in the project they want. `max_tokens` is the same
+per-cron budget override as the REST endpoint.
 
 **Scheduler behavior when the bound project is soft-deleted between
 definition and fire time:** the scheduler logs a warning to stderr
@@ -289,10 +305,12 @@ returns `None` for the deleted project, so the session runs project-less
 **CLI:**
 
 ```
-ark cron set <agent> <id> "<expr>" --prompt "..." --project <name>     # bind
-ark cron set <agent> <id> "<expr>" --prompt "..." --no-project          # detach
-ark cron set <agent> <id> "<expr>" --prompt "..."                       # keep whatever's already bound
-ark cron list <agent>                                                    # shows [project=<name>] annotation
+ark cron set <agent> <id> "<expr>" --prompt "..." --project <name>     # bind project
+ark cron set <agent> <id> "<expr>" --prompt "..." --no-project          # detach project
+ark cron set <agent> <id> "<expr>" --prompt "..." --max-tokens 2000000  # per-cron budget
+ark cron set <agent> <id> "<expr>" --prompt "..." --no-max-tokens       # revert to agent/global default
+ark cron set <agent> <id> "<expr>" --prompt "..."                       # keep whatever's already set
+ark cron list <agent>                                                    # shows [project=<name>] and [max_tokens=N]
 ```
 
 Sharp edges:

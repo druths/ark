@@ -572,18 +572,19 @@ def cmd_cron_list(args: argparse.Namespace) -> int:
         if c.get("project_id"):
             pname = c.get("project_name")
             proj = f" [project={pname}]" if pname else f" [project={c['project_id']} DELETED]"
+        budget = f" [max_tokens={c['max_tokens']}]" if c.get("max_tokens") else ""
         prompt = c["prompt"]
         if args.full:
             # Indent multi-line prompts under their header.
             indented = "\n".join("    " + line for line in prompt.splitlines())
-            print(f"{c['id']}: {c['expr']}{status}{proj}")
+            print(f"{c['id']}: {c['expr']}{status}{proj}{budget}")
             print(indented)
         else:
             # One-line preview. Collapse newlines so we don't break the table.
             preview = " ".join(prompt.split())
             if len(preview) > 100:
                 preview = preview[:100] + "…"
-            print(f"{c['id']}: {c['expr']}{status}{proj} — {preview}")
+            print(f"{c['id']}: {c['expr']}{status}{proj}{budget} — {preview}")
     return 0
 
 
@@ -607,6 +608,12 @@ def cmd_cron_set(args: argparse.Namespace) -> int:
             print(f"error: no project named '{args.project}'", file=sys.stderr)
             return 2
         body["project_id"] = matches[0]["id"]
+    # --max-tokens sets a per-cron budget; --no-max-tokens reverts to agent/
+    # global default. Neither → server preserves whatever's already set.
+    if args.no_max_tokens:
+        body["max_tokens"] = None
+    elif args.max_tokens is not None:
+        body["max_tokens"] = args.max_tokens
     r = httpx.put(
         f"{base_url}/agents/{args.agent}/crons/{args.id}",
         headers=headers,
@@ -915,6 +922,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-project",
         action="store_true",
         help="explicitly detach any project binding on the cron",
+    )
+    budget_grp = cron_set.add_mutually_exclusive_group()
+    budget_grp.add_argument(
+        "--max-tokens",
+        type=int,
+        help=(
+            "per-turn token budget for each fire (cumulative input+output). "
+            "Overrides the agent's setting and the global default."
+        ),
+    )
+    budget_grp.add_argument(
+        "--no-max-tokens",
+        action="store_true",
+        help=(
+            "explicitly revert this cron to using the agent's / global default "
+            "budget (drops any per-cron override)."
+        ),
     )
     cron_set.set_defaults(func=cmd_cron_set)
 

@@ -102,6 +102,14 @@ MIGRATIONS: list[tuple[int, str]] = [
         # project without cascading. The scheduler handles that gracefully.
         "ALTER TABLE crons ADD COLUMN project_id TEXT;",
     ),
+    (
+        6,
+        # Per-cron override of the turn's token budget. When null, resolution
+        # falls back to AgentConfig.max_turn_tokens, then to the runtime's
+        # DEFAULT_TURN_TOKEN_BUDGET constant. Replaces the old hardcoded
+        # max_iterations=16 cap on the model→tools loop.
+        "ALTER TABLE crons ADD COLUMN max_tokens INTEGER;",
+    ),
 ]
 
 

@@ -32,7 +32,7 @@ def sched(ark_home, tmp_path):
     s.cron_fires: list[tuple[str, str]] = []
     s.heartbeat_fires: list[str] = []
 
-    async def _fire_cron(agent_name, cron_id, prompt, project_id=None):
+    async def _fire_cron(agent_name, cron_id, prompt, project_id=None, max_tokens=None):
         s.cron_fires.append((agent_name, cron_id))
 
     async def _fire_heartbeat(agent_name):

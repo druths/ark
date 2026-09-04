@@ -378,7 +378,9 @@ def _set_heartbeat(*, seconds: float | None) -> str:
 
 
 def _add_cron(
-    *, id: str, expr: str, prompt: str, project_id: str | None = None
+    *, id: str, expr: str, prompt: str,
+    project_id: str | None = None,
+    max_tokens: int | None = None,
 ) -> str:
     # Validate cron expression
     try:
@@ -398,16 +400,19 @@ def _add_cron(
                 "available projects, or get_current_session_info to use the "
                 "project of the current session."
             )
+    if max_tokens is not None and (not isinstance(max_tokens, int) or max_tokens <= 0):
+        raise ToolError("max_tokens must be a positive integer if set")
     ctx.conn.execute(
-        "INSERT INTO crons(agent_name, id, expr, prompt, enabled, project_id) "
-        "VALUES (?,?,?,?,1,?) "
+        "INSERT INTO crons(agent_name, id, expr, prompt, enabled, project_id, max_tokens) "
+        "VALUES (?,?,?,?,1,?,?) "
         "ON CONFLICT(agent_name, id) DO UPDATE SET "
         "expr=excluded.expr, prompt=excluded.prompt, enabled=1, "
-        "project_id=excluded.project_id",
-        (ctx.agent.name, id, expr, prompt, project_id),
+        "project_id=excluded.project_id, max_tokens=excluded.max_tokens",
+        (ctx.agent.name, id, expr, prompt, project_id, max_tokens),
     )
     proj_suffix = f" (project={project_id})" if project_id else ""
-    return f"cron '{id}' set: {expr}{proj_suffix}"
+    budget_suffix = f" (max_tokens={max_tokens})" if max_tokens else ""
+    return f"cron '{id}' set: {expr}{proj_suffix}{budget_suffix}"
 
 
 def _remove_cron(*, id: str) -> str:
@@ -425,7 +430,7 @@ def _list_crons() -> str:
 
     ctx = current_context()
     rows = ctx.conn.execute(
-        "SELECT id, expr, prompt, project_id "
+        "SELECT id, expr, prompt, project_id, max_tokens "
         "FROM crons WHERE agent_name = ? AND enabled = 1 ORDER BY id",
         (ctx.agent.name,),
     ).fetchall()
@@ -440,7 +445,10 @@ def _list_crons() -> str:
                 proj_label = f" [project={p.name}]"
             else:
                 proj_label = f" [project={r['project_id']} DELETED]"
-        lines.append(f"{r['id']}: {r['expr']}{proj_label} — {r['prompt'][:60]}")
+        budget_label = f" [max_tokens={r['max_tokens']}]" if r["max_tokens"] else ""
+        lines.append(
+            f"{r['id']}: {r['expr']}{proj_label}{budget_label} — {r['prompt'][:60]}"
+        )
     return "\n".join(lines)
 
 
@@ -468,7 +476,11 @@ _register(
             "`get_current_session_info` for the current session's project). "
             "Omit or pass null for a project-less cron. Bound sessions inherit "
             "the project's system-prompt stanza from turn 1 and their uploads "
-            "land in the project's uploads dir."
+            "land in the project's uploads dir. Optional `max_tokens` is the "
+            "per-turn token budget (cumulative input+output across iterations) "
+            "for each fire; overrides the agent's setting and the global "
+            "default. Use when this specific cron needs a larger or smaller "
+            "budget than the agent's default."
         ),
         input_schema={
             "type": "object",
@@ -479,6 +491,13 @@ _register(
                 "project_id": {
                     "type": ["string", "null"],
                     "description": "Optional project uuid to bind each fire to.",
+                },
+                "max_tokens": {
+                    "type": ["integer", "null"],
+                    "description": (
+                        "Optional per-turn token budget for each fire "
+                        "(cumulative input+output across iterations)."
+                    ),
                 },
             },
             "required": ["id", "expr", "prompt"],
