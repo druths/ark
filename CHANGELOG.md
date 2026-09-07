@@ -1,5 +1,63 @@
 # Changelog
 
+## Unreleased — Real mid-turn cancellation for the `stop` command
+
+The `stop` WS command was previously a documented no-op — turn tasks
+were spawned via `asyncio.create_task(...)` and immediately discarded,
+so there was nothing to cancel with. Now it actually cancels the turn
+and terminates any in-flight shell commands.
+
+### How
+
+- **Turn registry.** `run_and_publish` registers `asyncio.current_task()`
+  in a per-session dict on entry and cleans up in `finally`. Every spawn
+  site — the WS handler, scheduler heartbeats and crons — gets cancel
+  support without call-site changes.
+- **`runtime.stop_turn(session_id)`** cancels the registered task if
+  one's running; returns `False` when nothing's in flight.
+- **Terminal event on cancel.** The task publishes
+  `done {"stopped": true, "stop_reason": "stopped"}` from a
+  `CancelledError` branch in `run_and_publish` before re-raising, so
+  clients see a clean turn end instead of a mid-stream drop.
+- **Process-group SIGTERM → SIGKILL discipline.** `run_command` now
+  runs in its own process group (`start_new_session=True`) and registers
+  each `Popen` per session. `tools.stop_session_commands(session_id)`
+  SIGTERMs the group immediately and escalates to SIGKILL after a 5s
+  grace via a daemon timer thread. Task cancellation alone can't reach
+  the subprocess: the command runs under `asyncio.to_thread`, and
+  cancelling the awaiter leaves the worker thread and its subprocess
+  running to timeout. **Side benefit**: the existing tool-timeout path
+  now also kills children, not just the shell.
+- **`stop` handler in the WS loop.** Cancels the turn + kills the
+  session's in-flight commands; fire-and-forget shape like
+  `user_message`. Silent no-op when nothing's running; an `error`
+  frame only when `session_id` is missing or non-string.
+
+### Test-injection fix rolled in
+
+`run_user_turn`'s `provider_factory=make_provider` default was bound
+at definition time — so the `runtime.make_provider` monkeypatch
+pattern that several tests already relied on never actually injected
+through `run_and_publish`. The default is late-bound now (`None →
+resolve to `make_provider` at call time`), matching what
+`compact_session` was already doing.
+
+### New tests
+
+`tests/test_stop_cancel.py` — 6 tests: WS-level mid-stream cancel
+ending in `done {stopped:true}` with the session immediately usable on
+the same socket, silent no-op when nothing's running,
+missing-`session_id` error frame, registry cancel + hygiene, and a
+process-group kill test (`sleep 30` terminated with exit code `-15`).
+
+### From PR #2
+
+Landed via [#2](https://github.com/druths/ark/pull/2) rebased onto the
+current main. The one conflict was `run_user_turn`'s signature —
+resolved by keeping the token budget (which supersedes the old
+`max_iterations` param the PR touched) and taking the PR's late-bound
+`provider_factory` fix.
+
 ## Unreleased — Richer error messages
 
 Provider errors surfaced on `/events` and persisted as `RunError` rows
