@@ -171,7 +171,7 @@ right session.
 | `compaction_failed` | `code`, `message`, `reason` | Summarizer call errored |
 | `compaction_skipped` | `reason`, `input_tokens`, `context_window` | Threshold crossed but compaction is disabled — warning-only, no action taken |
 | `session_project_changed` | `from_project_id`, `from_project_name`, `to_project_id`, `to_project_name`, `changed_at` | A session's project binding changed (see [projects.md § Reassigning a session's project](projects.md#reassigning-a-sessions-project)) |
-| `done` | `stop_reason` | Whole run-loop finished for that session, awaiting next user input. On classified errors, `stop_reason` is `"error:<code>"`. |
+| `done` | `stop_reason`, `stopped?` | Whole run-loop finished for that session, awaiting next user input. On classified errors, `stop_reason` is `"error:<code>"`. On a `stop`-triggered cancel, `stop_reason` is `"stopped"` and the event carries `stopped: true`. |
 
 Every event also carries `session_id` and (except for the broad "error" case
 where the session couldn't be identified) `agent_name`.
@@ -181,7 +181,7 @@ where the session couldn't be identified) `agent_name`.
 | Command | Required fields | Effect |
 |---|---|---|
 | `user_message` | `session_id`, `text` | Start a new turn in that session. Multiple sessions can have turns running concurrently — events stream back tagged with their `session_id`. |
-| `stop` | `session_id` | Request cancellation (v1: no-op — see design.md §6). |
+| `stop` | `session_id` | Cancel the in-flight turn for that session. Fire-and-forget: the cancellation lands as a terminal `done {"stopped": true, "stop_reason": "stopped"}` on the events stream. Silent no-op when no turn is running. Also terminates any in-flight `run_command` process group (SIGTERM immediately, SIGKILL after a 5s grace) so long-running shell commands don't outlive the cancel. |
 
 Per-session context is **not** added over the WS — it's a REST operation
 even mid-chat. The CLI does the REST call when you type `/context ...`.
