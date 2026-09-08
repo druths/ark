@@ -258,6 +258,7 @@ Each agent is keyed by name. The name is what you use everywhere — CLI
 | `compaction_enabled` | bool | no | Turn automatic session compaction on/off. Default `true`. See [sessions.md § Compaction](sessions.md#compaction). |
 | `compaction_threshold` | number | no | Fraction of `context_window` (strictly between 0 and 1) that triggers proactive compaction. Default `0.85`. |
 | `max_turn_tokens` | int | no | Per-agent override for the per-turn cumulative token budget (input+output across iterations). Positive integer. Falls back to `runtime.DEFAULT_TURN_TOKEN_BUDGET` (currently 500k). Per-cron entries can further override this. See [sessions.md § Turn token budget](sessions.md#turn-token-budget). |
+| `max_output_tokens` | int | no | Per-response output cap passed to the provider on every `stream_turn` call (the SDK's `max_tokens` kwarg). Positive integer. Falls back to 4096, which is generally too tight for agents that produce long documents/plans/code blocks. Distinct from `max_turn_tokens` — this caps a single model response, not cumulative work across a turn. See [sessions.md § Per-response output cap](sessions.md#per-response-output-cap). |
 
 Two files live alongside each agent's config — Ark creates them on
 `init` / `serve` if missing, and you edit them as part of agent design:

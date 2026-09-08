@@ -410,6 +410,42 @@ does NOT emit `TurnMetrics` and is not counted toward the budget.
 Positive integer or omit for the default. Per-cron override lives on the
 cron row itself — see [projects.md § Cron entries can be bound to a project](projects.md#cron-entries-can-be-bound-to-a-project).
 
+## Per-response output cap
+
+Separate from the turn budget above: `max_output_tokens` on `AgentConfig`
+sets the per-response cap the runtime passes to `provider.stream_turn(...)`
+on every call — the SDK's `max_tokens` kwarg. Falls back to **4096** when
+unset (matching every provider adapter's def-time default).
+
+```json
+"agents": {
+  "scribe": {
+    ...
+    "max_output_tokens": 16000
+  }
+}
+```
+
+**What it caps**: how much a single response from the model can be. A
+turn that runs 10 iterations of the model→tools loop can produce
+`10 × max_output_tokens` of output; this only bounds each iteration
+individually.
+
+**When to raise it**: agents that legitimately produce long single
+responses — drafting a document, writing a large code block, producing a
+detailed plan. The 4096 default truncates all of these mid-sentence with
+no client-visible warning beyond `stop_reason: "max_tokens"` on `done`.
+
+**When you can't set it to zero**: Anthropic requires `max_tokens` on
+every API call, so there is no "uncapped" option. OpenAI and Gemini
+would allow it, but Ark doesn't expose that variant today.
+
+**Truncation behavior**: when the model hits the cap mid-generation, the
+partial output is persisted, the run loop terminates naturally, and the
+client sees `done` with `stop_reason: "max_tokens"`. No `RunError`.
+Clients that want to make truncation visible can special-case that
+`stop_reason` in their UI.
+
 ## Compaction
 
 When a session grows large, Ark automatically summarizes prior turns into a

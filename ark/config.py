@@ -56,6 +56,12 @@ class AgentConfig:
     # Override for the model's input-token ceiling. Optional — falls back to
     # the table in ark.models. Used purely to compute the usage indicator.
     max_context_tokens: int | None = None
+    # Per-agent per-response output cap passed to the provider on every
+    # stream_turn call. Optional — falls back to the SDK default of 4096,
+    # which truncates long plans/outputs. Distinct from `max_turn_tokens`
+    # (whole-turn budget) and cron `max_tokens` (per-cron turn budget) —
+    # this caps a SINGLE model response, not cumulative work across a turn.
+    max_output_tokens: int | None = None
     # MCP servers this agent may access. Names reference Config.mcp_servers.
     # Servers not listed here are invisible to the agent even if configured
     # globally.
@@ -229,6 +235,11 @@ def _agents(
             raise ConfigError(
                 f"agents.{name}.max_context_tokens must be a positive integer if set"
             )
+        max_out = cfg.get("max_output_tokens")
+        if max_out is not None and (not isinstance(max_out, int) or max_out <= 0):
+            raise ConfigError(
+                f"agents.{name}.max_output_tokens must be a positive integer if set"
+            )
         agent_mcp = cfg.get("mcp_servers") or []
         if not isinstance(agent_mcp, list) or not all(
             isinstance(s, str) for s in agent_mcp
@@ -281,6 +292,7 @@ def _agents(
             workspace=workspace,
             always_loaded_skills=list(skills),
             max_context_tokens=max_ctx,
+            max_output_tokens=max_out,
             mcp_servers=list(agent_mcp),
             always_loaded_mcp_servers=list(always_mcp),
             compaction_enabled=compaction_enabled,
