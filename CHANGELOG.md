@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased — Per-agent per-response output cap (`max_output_tokens`)
+
+Every provider adapter's `stream_turn` accepts `max_tokens` and defaults
+to `4096`; `run_user_turn` never overrode it, so 4096 was effectively
+hardcoded. Agents that produced long single responses (drafts, plans,
+large code blocks) got truncated mid-sentence with no way to raise the
+cap in config.
+
+Adds a per-agent `max_output_tokens` field on `AgentConfig`. When set,
+the runtime passes it as `max_tokens` to `stream_turn` on every call.
+When absent (the default), behavior is unchanged from before this PR.
+
+```json
+"agents": {
+  "scribe": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "max_output_tokens": 16000
+  }
+}
+```
+
+Positive integer. Absent → 4096. See
+[docs/sessions.md § Per-response output cap](docs/sessions.md#per-response-output-cap).
+
+### Distinct from the other three token controls
+
+- **`max_output_tokens`** (this): caps a single provider response.
+- **`max_turn_tokens`** (already shipped): caps cumulative input+output
+  across all iterations of one turn.
+- **cron `max_tokens`** (already shipped): per-cron override for
+  `max_turn_tokens`.
+- **Compaction/context window** (already shipped): caps input via
+  auto-summarization.
+
+They stack. This one is the one that fixes "the model's response cut
+off at 4096 tokens mid-sentence."
+
+### From PR #1
+
+Landed via [#1](https://github.com/druths/ark/pull/1) rebased onto
+current main and renamed `max_tokens` → `max_output_tokens` before
+merge. The original name would have collided with `crons.max_tokens`
+(per-turn budget) — same word, different scope. The new name is
+unambiguous and matches Google's SDK naming exactly.
+
 ## Unreleased — Opaque server-only session metadata
 
 Adds a `metadata` field to session creation — an opaque JSON object stored
