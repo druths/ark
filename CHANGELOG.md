@@ -1,5 +1,68 @@
 # Changelog
 
+## Unreleased — Opaque server-only session metadata
+
+Adds a `metadata` field to session creation — an opaque JSON object stored
+server-side and surfaced to skills via `ToolContext.metadata`, but
+**never** rendered into the system prompt, the LLM message list, or any
+read API. See [docs/sessions.md § Session metadata](docs/sessions.md#session-metadata).
+
+### Threat model this addresses
+
+`SessionContext` text is model-visible, so a prompt-injection attack (a
+hostile document, a compromised web page) can trick the agent into
+leaking or misusing whatever it contains. That's fine for
+persona/behavior nudges but disastrous for capability credentials
+(callback URLs + secrets, per-tenant API tokens, upstream permissions).
+
+Metadata is deliberately kept on the same unforgeable server-side
+channel as `session_id`: the model can neither observe nor mutate it.
+
+### Schema migration v7
+
+`ALTER TABLE sessions ADD COLUMN metadata_json TEXT` (nullable). Existing
+sessions have `NULL`; skills reading `ctx.metadata` get `{}`.
+
+### API changes
+
+- **`POST /agents/{name}/sessions`** accepts optional `metadata: {...}`
+  in the body. `400` if present but not a JSON object.
+- **`runtime.create_session(..., metadata=None)`** — new kwarg. Existing
+  callers unaffected.
+- **`runtime.session_metadata(conn, sid)`** — read-back helper returning
+  `{}` when absent, malformed, or not an object.
+- **`ToolContext.metadata`** — new field, default `None`. Populated to
+  the session's metadata during a turn. Every existing `ToolContext(...)`
+  construction site keeps working (the default preserves the signature).
+
+### Guarantees (tested)
+
+- Not in the system prompt.
+- Not in the message list sent to the provider (leak test in the suite
+  asserts the value appears in neither `system` nor `messages` during a
+  tool-calling turn).
+- Not surfaced by `GET /sessions`, `GET /sessions/{sid}`, or the history
+  endpoint.
+- Read-only from skills — the field is a dict, but there's no persistence
+  path from `ctx.metadata` writes (by design).
+
+### Sharp edges
+
+- **Immutable within a session.** Set at creation only; no PATCH endpoint
+  in v1. Rotating a callback secret means starting a new session.
+- **Empty by default.** Skills should handle missing keys defensively.
+- **Server-only.** Restoring metadata from a backup requires the DB row;
+  it isn't reconstructable from message history.
+
+### From PR #3
+
+Landed via [#3](https://github.com/druths/ark/pull/3) rebased onto
+current main. Two adjustments during rebase:
+- The PR's stop-cancel commit is already in main (via #6) — cherry-picked
+  only the metadata commit.
+- Migration renumbered from 5 → 7 (main already has 5 for
+  `crons.project_id` and 6 for `crons.max_tokens`).
+
 ## Unreleased — Real mid-turn cancellation for the `stop` command
 
 The `stop` WS command was previously a documented no-op — turn tasks
