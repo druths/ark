@@ -16,13 +16,21 @@ All require `Authorization: Bearer <auth_secret>`.
 
 ```
 POST /agents/{name}/sessions
-Body (optional): { "context": "..." }
+Body (optional): {
+  "context"?: "...",
+  "project_id"?: "<uuid>",
+  "metadata"?: { ... }               // opaque server-only JSON object
+}
 → { "id": "<uuid>" }
 ```
 
 Always creates a `conversational` session. If `context` is provided, it's
 appended as the session's first `SessionContext` message — see
-[Per-session context](#per-session-context) below.
+[Per-session context](#per-session-context) below. If `project_id` is
+provided, the session is bound to that project — see
+[projects.md § Binding a session to a project](projects.md#binding-a-session-to-a-project).
+If `metadata` is provided, it's stored server-side and made available to
+skills — see [Session metadata](#session-metadata) below.
 
 Empty or absent bodies are accepted (creates an empty session, no context).
 `Content-Type` of `application/json` is not strictly required for the empty
@@ -135,6 +143,67 @@ ark chat <agent> --session SID --context "..." # append to a resumed session
 # mid-chat
 you> /context <additional instructions>
 ```
+
+## Session metadata
+
+A parallel channel to per-session context, but **server-only** — never
+rendered into the system prompt, never in the LLM message list, never
+surfaced by any read API. Set once at session creation via the
+`metadata` field on `POST /agents/{name}/sessions`; available to skills
+via `current_context().metadata`.
+
+```
+POST /agents/{name}/sessions
+Body: { "metadata": { "callback_url": "...", "callback_secret": "..." } }
+```
+
+The value must be a JSON object (`400` otherwise). Skills read it as:
+
+```python
+from ark.tools import current_context
+
+def my_tool():
+    ctx = current_context()
+    callback_url = ctx.metadata.get("callback_url")   # {} if none supplied
+    ...
+```
+
+### Why it exists
+
+`SessionContext` text ends up in the model-visible conversation, where a
+prompt-injection attack — a hostile document, a compromised web page —
+can trick the agent into leaking or misusing the text. That's fine for
+persona/behavior nudges but disastrous for capability credentials.
+
+Metadata is deliberately kept on the same unforgeable server-side channel
+as `session_id`: the model can neither observe nor mutate it. Use it for
+per-session capabilities the skill needs but the model must never see:
+
+- Callback URL + secret pair for a client-side tool gateway
+- Per-tenant API tokens the skill will pass to an upstream service
+- User identity/permissions the skill will check before acting
+
+### Guarantees
+
+- **Not in the system prompt.** The prompt is built from persona,
+  environment, project, and `SessionContext` — never from metadata.
+- **Not in the message list.** Metadata never appears as a `UserText` or
+  any other message kind sent to the provider.
+- **Not surfaced by read APIs.** `GET /sessions`, `GET /sessions/{sid}`,
+  `GET /agents/{name}/sessions/{sid}/history` all omit metadata. It
+  exists only on the row and in `ToolContext.metadata` during a turn.
+- **Immutable within a session.** Set at creation; no update endpoint in
+  v1. Rotating a callback secret today means starting a new session.
+  (`PATCH /sessions/{sid}/metadata` is a natural follow-on if needed.)
+- **Read-only from skills.** `ctx.metadata` is a dict, but writes from a
+  skill don't persist — this is by design: writable metadata would let
+  the model indirectly influence the channel, defeating the purpose.
+
+### Empty by default
+
+`ctx.metadata` is `{}` when nothing was supplied. Skills that expect
+specific keys should handle absence explicitly rather than relying on
+the caller.
 
 ## The event stream (unified per-client)
 

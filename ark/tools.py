@@ -38,6 +38,10 @@ class ToolContext:
     session_id: str
     cwd: Path
     loaded_skills: set[str]  # mutable set of skill names loaded for this session
+    # Client-supplied session metadata (create_session `metadata`): the same
+    # unforgeable server-side channel as session_id — never model-visible.
+    # Skills read per-session capabilities from here (e.g. a callback pair).
+    metadata: dict | None = None
 
 
 _context: ContextVar[ToolContext] = ContextVar("ark_tool_context")
