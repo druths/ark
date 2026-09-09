@@ -245,6 +245,62 @@ right session.
 Every event also carries `session_id` and (except for the broad "error" case
 where the session couldn't be identified) `agent_name`.
 
+### Event ids
+
+Events that correspond to a **persisted `messages` row** carry an
+`event_id` field on the wire — the same integer `messages.id` that
+`GET /events` returns for the row in catch-up.
+
+Purpose: lets clients maintain a **durable cursor** that advances from
+the live WS AND catch-up REST uniformly. On reconnect, a client fetches
+`GET /events?since_id=<last_seen_event_id>` and skips whatever it already
+saw via the live stream — no time-window text-hash dedupe required.
+
+| Wire event | Persisted? | `event_id` |
+|---|---|---|
+| `assistant_delta` | No (streamed segments — final `AssistantText` at turn end) | No |
+| `assistant_message` | Yes (`AssistantText`) | **Yes** (when the turn produced text) |
+| `thinking` | No | No |
+| `tool_call` | Yes (`ToolCall`) but persisted at TurnEnd, after this frame ships | **No** — see note below |
+| `tool_result` | Yes (`ToolResult`) | **Yes** |
+| `turn_usage` | Yes (`TurnMetrics`) | **Yes** |
+| `error` | Yes (`RunError` — includes the outer-catch escape path) | **Yes** |
+| `compaction_started` / `_failed` / `_skipped` | No (lifecycle markers) | No |
+| `compaction_completed` | Yes (`CompactionSummary`) | **Yes** |
+| `session_project_changed` | Yes (`ProjectAssignmentChanged`) | **Yes** |
+| `injected_message` | Yes (`AssistantText` in target session) | **Yes** |
+| `file_available` | Yes (`SharedFile`) | **Yes** |
+| `workspace_file_changed` / `project_file_changed` | No (external FS events) | No |
+| `done` | No (per-run terminator) | No |
+
+**Client contract**: `event_id` absent → don't advance cursor. `event_id`
+present → cursor := max(cursor, event_id). On reconnect,
+`GET /events?since_id=cursor` picks up everything the live socket
+missed, with no duplication of what the live socket already delivered.
+
+**About `tool_call`**: the `ToolCall` row is persisted at the end of the
+assistant turn (with `AssistantText`), not at the moment the streaming
+frame is yielded. Adding `event_id` there would require reordering the
+DB `seq` in a way that changes what the provider sees on subsequent
+turns (Anthropic in particular expects assistant text before tool_use in
+each block). Clients that want to reference a specific tool call by
+persisted-row id can consume the corresponding `tool_result` frame's
+`event_id` and read the paired `ToolCall` row from `/history`, or rely
+on the tool-call correlation id in the frame's `id` field for live-only
+matching.
+
+**About the outer-catch `error` path**: if something escapes
+`run_user_turn` entirely (a programming error, a broker failure, etc.),
+the runtime now persists a `RunError` row for it too — same shape as
+in-turn errors — so those `error` frames carry `event_id`. If the DB
+write itself fails (unlikely but possible), the frame goes out without
+`event_id` as a best-effort fallback.
+
+**About wire naming**: the field is `event_id` (not `id`) to avoid
+colliding with `tool_call.id` / `tool_result.id`, which are the
+tool-call correlation ids for pairing request→response frames — a
+different identifier space.
+
 ### Client → server commands
 
 | Command | Required fields | Effect |

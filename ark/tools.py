@@ -621,7 +621,7 @@ def _post_to_session(*, session_id: str, body: str) -> str:
             f"session {session_id} not found, or not owned by agent {ctx.agent.name}"
         )
     msg = AssistantText(text=body, injected_from=ctx.session_id)
-    runtime.append_message(ctx.conn, session_id, msg)
+    row_id = runtime.append_message(ctx.conn, session_id, msg)
     broker.publish(
         session_id,
         {
@@ -630,6 +630,7 @@ def _post_to_session(*, session_id: str, body: str) -> str:
             "agent_name": ctx.agent.name,
             "from_session_id": ctx.session_id,  # source session (where this came from)
             "text": body,
+            "event_id": row_id,                 # messages.id — cursor advances here too
         },
     )
     return f"posted to session {session_id}"
@@ -877,7 +878,7 @@ def _share_with_client(*, path: str, description: str = "") -> str:
 
     rel = ws.relative_to_workspace(ctx.agent.workspace, full)
     size = full.stat().st_size
-    runtime.append_message(
+    row_id = runtime.append_message(
         ctx.conn, ctx.session_id, SharedFile(path=rel, description=description, size=size)
     )
     broker.publish(
@@ -889,6 +890,7 @@ def _share_with_client(*, path: str, description: str = "") -> str:
             "path": rel,
             "description": description,
             "size": size,
+            "event_id": row_id,
         },
     )
     return f"shared {rel} with the client ({size} bytes)"

@@ -195,17 +195,26 @@ def load_history(conn: sqlite3.Connection, session_id: str) -> list[Message]:
     return [message_from_row(r["role"], json.loads(r["content_json"])) for r in rows]
 
 
-def append_message(conn: sqlite3.Connection, session_id: str, msg: Message) -> None:
+def append_message(conn: sqlite3.Connection, session_id: str, msg: Message) -> int:
+    """Append `msg` to the session's message log and return the new row's
+    globally-monotonic `id` (autoincrement on `messages.id`).
+
+    That id is the same one `GET /events` exposes as `next_since_id`, so
+    live events published via the broker can carry the same identifier
+    downstream clients see on catch-up — enabling deterministic dedupe
+    across the live-WS and catch-up-REST surfaces (see docs/sessions.md's
+    "Event ids" section)."""
     role, content = message_to_row(msg)
     next_seq = conn.execute(
         "SELECT COALESCE(MAX(seq), -1) + 1 FROM messages WHERE session_id = ?",
         (session_id,),
     ).fetchone()[0]
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO messages(session_id, seq, role, content_json, created_at) "
         "VALUES (?,?,?,?,?)",
         (session_id, next_seq, role, json.dumps(content), now_ms()),
     )
+    return int(cur.lastrowid)
 
 
 # ---------------------------------------------------------------------------
@@ -309,14 +318,17 @@ def set_session_project(
     conn: sqlite3.Connection,
     session_id: str,
     new_project_id: str | None,
-) -> tuple[Project | None, Project | None] | None:
-    """Change a session's project binding. Returns (from_project, to_project)
-    on a real change, or None when the assignment is unchanged (idempotent
-    no-op — caller can treat as success without emitting a marker).
+) -> tuple[Project | None, Project | None, int] | None:
+    """Change a session's project binding. Returns
+    ``(from_project, to_project, marker_row_id)`` on a real change, or
+    ``None`` when the assignment is unchanged (idempotent no-op — caller
+    can treat as success without emitting a marker).
 
     Also appends a `ProjectAssignmentChanged` marker to session history so
     the next turn's LLM message list shows the transition, and clients can
-    render a "project changed" divider in the timeline.
+    render a "project changed" divider in the timeline. `marker_row_id` is
+    the persisted row's `messages.id`; the endpoint attaches it as
+    `event_id` on the broker `session_project_changed` frame.
 
     Callers should have already validated: session exists, agent owns it,
     the new project exists and is not soft-deleted, and no pending tool
@@ -340,7 +352,7 @@ def set_session_project(
         "UPDATE sessions SET project_id = ? WHERE id = ?",
         (new_project_id, session_id),
     )
-    append_message(
+    marker_id = append_message(
         conn,
         session_id,
         ProjectAssignmentChanged(
@@ -353,7 +365,7 @@ def set_session_project(
             changed_at=now_ms(),
         ),
     )
-    return from_project, to_project
+    return from_project, to_project, marker_id
 
 
 def classify_provider_error(exc: Exception) -> tuple[str, str]:
@@ -678,10 +690,12 @@ async def compact_session(
         )
         return
 
-    append_message(
+    summary_row_id = append_message(
         conn, session_id, CompactionSummary(text=summary_text, reason=reason)
     )
-    yield CompactionCompletedEvent(summary=summary_text, reason=reason)
+    yield CompactionCompletedEvent(
+        summary=summary_text, reason=reason, row_id=summary_row_id
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -815,10 +829,17 @@ async def run_user_turn(
                 elif isinstance(evt, ThinkingDelta):
                     yield evt
                 elif isinstance(evt, ToolCallEvent):
+                    # Live tool_call events go out without row_id: the row is
+                    # persisted at TurnEnd (below), and we intentionally
+                    # preserve today's DB ordering (AssistantText before
+                    # ToolCall in `seq`) so provider adapters that
+                    # reconstruct assistant blocks see the same shape they
+                    # always have. Clients dedupe against the persisted-row
+                    # events (assistant_message, tool_result) instead.
                     pending_tool_calls.append(evt)
                     yield evt
                 elif isinstance(evt, TurnUsageEvent):
-                    append_message(
+                    metrics_id = append_message(
                         conn,
                         session_id,
                         TurnMetrics(
@@ -829,17 +850,22 @@ async def run_user_turn(
                     )
                     tokens_used += evt.input_tokens + evt.output_tokens
                     # Re-emit with the agent's known context_window so the
-                    # client can show a percentage.
+                    # client can show a percentage. row_id lets clients
+                    # advance their durable cursor from the live stream.
                     yield TurnUsageEvent(
                         input_tokens=evt.input_tokens,
                         output_tokens=evt.output_tokens,
                         model=evt.model or agent.model,
                         context_window=context_window,
+                        row_id=metrics_id,
                     )
                 elif isinstance(evt, AssistantTurnEnd):
                     last_stop_reason = evt.stop_reason
+                    text_id: int | None = None
                     if turn_text:
-                        append_message(conn, session_id, AssistantText(text=turn_text))
+                        text_id = append_message(
+                            conn, session_id, AssistantText(text=turn_text)
+                        )
                     for tc in pending_tool_calls:
                         append_message(
                             conn,
@@ -851,7 +877,11 @@ async def run_user_turn(
                                 thought_signature=tc.thought_signature,
                             ),
                         )
-                    yield AssistantTurnEnd(text=turn_text, stop_reason=evt.stop_reason)
+                    yield AssistantTurnEnd(
+                        text=turn_text,
+                        stop_reason=evt.stop_reason,
+                        row_id=text_id,
+                    )
         except Exception as exc:  # noqa: BLE001
             code, message = classify_provider_error(exc)
             # Reactive compaction: if the provider rejects for context length
@@ -894,8 +924,10 @@ async def run_user_turn(
             _log_error_traceback(
                 f"[runtime] turn error in session {session_id} (code={code}):"
             )
-            append_message(conn, session_id, RunError(code=code, message=message))
-            yield RunErrorEvent(code=code, message=message)
+            err_id = append_message(
+                conn, session_id, RunError(code=code, message=message)
+            )
+            yield RunErrorEvent(code=code, message=message, row_id=err_id)
             yield RunEnd(stop_reason=f"error:{code}")
             return
 
@@ -914,14 +946,16 @@ async def run_user_turn(
         )
         for tc in pending_tool_calls:
             output, is_error = await tools.execute(tc.name, tc.input, ctx=ctx)
-            append_message(
+            result_id = append_message(
                 conn,
                 session_id,
                 ToolResult(
                     call_id=tc.id, output=output, is_error=is_error, name=tc.name
                 ),
             )
-            yield ToolResultEvent(call_id=tc.id, output=output, is_error=is_error)
+            yield ToolResultEvent(
+                call_id=tc.id, output=output, is_error=is_error, row_id=result_id
+            )
 
         # Budget check between iterations. At least one iteration always runs
         # (the check happens AFTER the first iteration's TurnMetrics lands);
@@ -931,11 +965,15 @@ async def run_user_turn(
                 f"turn used {tokens_used} cumulative input+output tokens; "
                 f"budget was {effective_budget}"
             )
-            append_message(
+            budget_err_id = append_message(
                 conn, session_id,
                 RunError(code="token_budget_exceeded", message=message),
             )
-            yield RunErrorEvent(code="token_budget_exceeded", message=message)
+            yield RunErrorEvent(
+                code="token_budget_exceeded",
+                message=message,
+                row_id=budget_err_id,
+            )
             yield RunEnd(stop_reason="error:token_budget_exceeded")
             return
 
@@ -977,6 +1015,13 @@ def event_to_wire(evt: RuntimeEvent | Message) -> dict:
 
     Lives in runtime.py rather than server.py so both the WebSocket handler
     and the scheduler can use it without circular imports.
+
+    Events corresponding to a persisted `messages` row carry `event_id`
+    (matching `messages.id`) so downstream clients can maintain a durable
+    cursor across the live WS and REST catch-up paths. Ephemeral events
+    (TextDelta, ThinkingDelta, RunEnd, lifecycle-only compaction frames,
+    the outer-catch error path) omit `event_id` — the client contract is
+    "no event_id → don't advance cursor."
     """
 
     if isinstance(evt, TextDelta):
@@ -984,26 +1029,42 @@ def event_to_wire(evt: RuntimeEvent | Message) -> dict:
     if isinstance(evt, ThinkingDelta):
         return {"type": "thinking", "delta": evt.text}
     if isinstance(evt, AssistantTurnEnd):
-        return {"type": "assistant_message", "text": evt.text}
+        out = {"type": "assistant_message", "text": evt.text}
+        if evt.row_id is not None:
+            out["event_id"] = evt.row_id
+        return out
     if isinstance(evt, ToolCallEvent):
+        # Live tool_call frames are persisted at TurnEnd, so no event_id at
+        # the point they go out. Clients dedupe on the tool-call correlation
+        # id (`id`, matching the eventual tool_result frame's `id`), or fall
+        # back to catch-up for the durable identity.
         return {"type": "tool_call", "id": evt.id, "name": evt.name, "input": evt.input}
     if isinstance(evt, ToolResultEvent):
-        return {
+        out = {
             "type": "tool_result",
             "id": evt.call_id,
             "output": evt.output,
             "error": evt.is_error,
         }
+        if evt.row_id is not None:
+            out["event_id"] = evt.row_id
+        return out
     if isinstance(evt, TurnUsageEvent):
-        return {
+        out = {
             "type": "turn_usage",
             "input_tokens": evt.input_tokens,
             "output_tokens": evt.output_tokens,
             "model": evt.model,
             "context_window": evt.context_window,
         }
+        if evt.row_id is not None:
+            out["event_id"] = evt.row_id
+        return out
     if isinstance(evt, RunErrorEvent):
-        return {"type": "error", "code": evt.code, "message": evt.message}
+        out = {"type": "error", "code": evt.code, "message": evt.message}
+        if evt.row_id is not None:
+            out["event_id"] = evt.row_id
+        return out
     if isinstance(evt, CompactionStartedEvent):
         return {
             "type": "compaction_started",
@@ -1013,11 +1074,14 @@ def event_to_wire(evt: RuntimeEvent | Message) -> dict:
             "model": evt.model,
         }
     if isinstance(evt, CompactionCompletedEvent):
-        return {
+        out = {
             "type": "compaction_completed",
             "summary": evt.summary,
             "reason": evt.reason,
         }
+        if evt.row_id is not None:
+            out["event_id"] = evt.row_id
+        return out
     if isinstance(evt, CompactionFailedEvent):
         return {
             "type": "compaction_failed",
@@ -1093,20 +1157,33 @@ async def run_and_publish(
         raise
     except Exception as e:  # noqa: BLE001
         # run_user_turn catches provider exceptions itself; this is for anything
-        # that escapes (programming errors, broker failures, etc.).
+        # that escapes (programming errors, broker failures, etc.). We persist
+        # this as a RunError too — same shape as the in-turn error path — so
+        # the error carries a durable event_id and shows up in /history and
+        # catch-up. Closes the "no event_id → cursor stalls" gap for the
+        # rare-but-real class of unhandled escapes.
         _log_error_traceback(
             f"[runtime] unhandled error in run_and_publish for session {session_id}:"
         )
-        broker.publish(
-            session_id,
-            {
-                "type": "error",
-                "session_id": session_id,
-                "agent_name": agent.name,
-                "code": "other",
-                "message": _format_provider_error_message(e, type(e).__name__, str(e)),
-            },
-        )
+        wire_msg = _format_provider_error_message(e, type(e).__name__, str(e))
+        try:
+            err_id = append_message(
+                conn, session_id, RunError(code="other", message=wire_msg)
+            )
+        except Exception:  # noqa: BLE001
+            # Best-effort: if even the DB write fails, publish without an id
+            # rather than dropping the error frame entirely.
+            err_id = None
+        payload = {
+            "type": "error",
+            "session_id": session_id,
+            "agent_name": agent.name,
+            "code": "other",
+            "message": wire_msg,
+        }
+        if err_id is not None:
+            payload["event_id"] = err_id
+        broker.publish(session_id, payload)
     finally:
         if task is not None and _active_turns.get(session_id) is task:
             del _active_turns[session_id]

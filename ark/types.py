@@ -208,10 +208,14 @@ class ThinkingDelta:
 
 @dataclass
 class ToolCallEvent:
-    id: str
+    id: str                # tool-call correlation id (matches ToolResultEvent.call_id)
     name: str
     input: dict[str, Any]
     thought_signature: bytes | None = None  # see ToolCall.thought_signature
+    # messages.id of the corresponding ToolCall row (populated by the
+    # runtime after append_message). See event_to_wire — surfaces as
+    # `event_id` on the wire for durable-cursor dedupe.
+    row_id: int | None = None
 
 
 @dataclass
@@ -219,6 +223,7 @@ class ToolResultEvent:
     call_id: str
     output: str
     is_error: bool = False
+    row_id: int | None = None  # messages.id of ToolResult row
 
 
 @dataclass
@@ -227,6 +232,9 @@ class AssistantTurnEnd:
 
     text: str  # full assembled assistant text for this turn
     stop_reason: str | None = None
+    # messages.id of the corresponding AssistantText row. None when the
+    # turn ended with no text (only tool calls, or an error mid-generation).
+    row_id: int | None = None
 
 
 @dataclass
@@ -247,6 +255,7 @@ class TurnUsageEvent:
     output_tokens: int
     model: str = ""
     context_window: int | None = None  # provider's known max, if any
+    row_id: int | None = None           # messages.id of TurnMetrics row
 
 
 @dataclass
@@ -255,6 +264,7 @@ class RunErrorEvent:
 
     code: str  # one of: context_too_long, rate_limit, auth, other
     message: str
+    row_id: int | None = None  # messages.id of RunError row
 
 
 @dataclass
@@ -275,6 +285,7 @@ class CompactionCompletedEvent:
 
     summary: str
     reason: str = ""
+    row_id: int | None = None  # messages.id of CompactionSummary row
 
 
 @dataclass

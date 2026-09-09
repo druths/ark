@@ -391,7 +391,7 @@ def create_app(config: Config) -> FastAPI:
         result = runtime.set_session_project(conn, sid, new_project_id)
         if result is None:
             return {"ok": True, "changed": False}
-        from_p, to_p = result
+        from_p, to_p, marker_id = result
 
         def _proj_dict(p):
             if p is None:
@@ -409,6 +409,7 @@ def create_app(config: Config) -> FastAPI:
                 "to_project_id": to_p.id if to_p else None,
                 "to_project_name": to_p.name if to_p else None,
                 "changed_at": runtime.now_ms(),
+                "event_id": marker_id,
             },
         )
         return {
@@ -468,13 +469,14 @@ def create_app(config: Config) -> FastAPI:
             }
             broker.publish(sid, started)
             from .types import CompactionSummary
-            runtime.append_message(
+            summary_row_id = runtime.append_message(
                 conn, sid, CompactionSummary(text=supplied.strip(), reason=reason)
             )
             completed = {
                 "type": "compaction_completed",
                 "session_id": sid, "agent_name": name,
                 "summary": supplied.strip(), "reason": reason,
+                "event_id": summary_row_id,
             }
             broker.publish(sid, completed)
             return {"ok": True, "summary": supplied.strip(), "reason": reason}

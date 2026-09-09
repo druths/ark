@@ -1,5 +1,97 @@
 # Changelog
 
+## Unreleased — `event_id` on live WS events for durable-cursor dedupe
+
+Live `/events` WS frames that correspond to a persisted `messages` row
+now carry `event_id` — the same integer `messages.id` that `GET /events`
+returns on catch-up. Clients can maintain a durable cursor across the
+live and catch-up surfaces uniformly; on reconnect,
+`GET /events?since_id=<cursor>` picks up the gap without re-delivering
+anything the live socket already emitted. See
+[docs/sessions.md § Event ids](docs/sessions.md#event-ids).
+
+### Motivation
+
+Previously, live WS events had no id. A client staying up for hours
+between catch-ups would never advance its cursor, so the next
+`GET /events` re-fetched everything back to the last catch-up — every
+one of which the client already processed live. The workaround was
+substring-containment SQL dedupe in a 30-day window, expensive and
+wrong for legitimately-repeated cron output.
+
+Multi-segment turns compounded the pain: the live path emits many
+`assistant_delta` + one `assistant_message`; catch-up sees one
+`AssistantText` row. Without a stable per-event identifier, no dedupe
+strategy worked cleanly across both shapes.
+
+### What lands on the wire
+
+Every event whose underlying row is persisted gains `event_id`:
+
+- `assistant_message`, `tool_result`, `turn_usage`, `error`,
+  `compaction_completed`, `session_project_changed`, `injected_message`,
+  `file_available`
+
+Ephemeral events (streaming deltas, lifecycle-only compaction frames,
+external filesystem events, per-turn `done`) carry no `event_id`. Client
+contract: **no `event_id` → don't advance cursor**. Persisted-row events
+are the exclusive source of cursor advancement.
+
+### One deliberate exception
+
+`tool_call` (live) does NOT carry `event_id`. The `ToolCall` row is
+persisted at TurnEnd — after this frame ships — and reordering the DB
+`seq` to persist earlier would change what provider adapters see on
+subsequent turns (Anthropic in particular expects text-before-tool_use
+in assistant blocks). Clients dedupe against the paired `tool_result`
+frame (which has `event_id`) or consume `/history` for the durable
+identity.
+
+### One new behavior worth flagging
+
+**The outer-catch `error` path now persists a `RunError` row.** Prior
+behavior: unhandled escapes from `run_user_turn` (programming errors,
+broker failures, etc.) published an `error` frame but wrote nothing to
+history. Now they persist a `RunError` too, so the frame carries
+`event_id` and the error shows up in `/history` and catch-up. Closes
+the "no `event_id` → cursor stalls" gap for the rare-but-real class of
+unhandled escapes. If the DB write itself fails (very unlikely), the
+frame still goes out — just without `event_id`, as a best-effort
+fallback.
+
+### Wire naming: `event_id`, not `id`
+
+`tool_call.id` and `tool_result.id` already meant the tool-call
+correlation id (for pairing request→response frames). Using `id` for
+the messages row would collide. `event_id` is the additive field name
+used everywhere.
+
+### API changes
+
+- **`runtime.append_message(conn, session_id, msg) -> int`** — now
+  returns the new row's globally-monotonic `messages.id`. Callers that
+  ignored the return before continue to work.
+- **`runtime.set_session_project(...)`** — now returns a 3-tuple
+  `(from_project, to_project, marker_row_id)` on a real change (was
+  2-tuple); no-op still returns `None`.
+- **`RuntimeEvent` dataclasses** — `AssistantTurnEnd`, `ToolCallEvent`,
+  `ToolResultEvent`, `TurnUsageEvent`, `RunErrorEvent`,
+  `CompactionCompletedEvent` gain optional `row_id: int | None = None`.
+  All defaults are `None`, so every existing construction site is
+  unaffected.
+- **`event_to_wire`** — persists `event_id` on the wire when the event
+  carries a `row_id`.
+
+### Tests
+
+`tests/test_event_ids.py` (16 tests): `append_message` return value,
+wire-format `event_id` presence/absence per event kind, end-to-end
+runtime tests that live event ids match persisted row ids, broker
+publish sites (session_project_changed, client-supplied compaction) fire
+with `event_id`, outer-catch escape persists + carries id, and a
+catch-up alignment test proving live `event_id == GET /events id` for
+the same row.
+
 ## Unreleased — Per-agent per-response output cap (`max_output_tokens`)
 
 Every provider adapter's `stream_turn` accepts `max_tokens` and defaults
