@@ -1044,6 +1044,12 @@ def create_app(config: Config) -> FastAPI:
                 # Spawn the turn as a background task — multiple sessions can
                 # have turns running concurrently. Their events all flow back
                 # through this same WS via the broker subscription.
+                # Optional `timezone` field: IANA zone name the client is in
+                # right now (e.g. "America/Los_Angeles"). Used for the
+                # date-change marker + env-stanza "today's date" line.
+                # Invalid or absent → UTC fallback inside the runtime.
+                client_tz_raw = cmd.get("timezone")
+                client_tz = client_tz_raw if isinstance(client_tz_raw, str) else None
                 asyncio.create_task(
                     runtime.run_and_publish(
                         conn=conn,
@@ -1051,6 +1057,7 @@ def create_app(config: Config) -> FastAPI:
                         agent=agent,
                         session_id=sid,
                         user_text=cmd.get("text", ""),
+                        client_timezone=client_tz,
                     )
                 )
         except WebSocketDisconnect:

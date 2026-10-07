@@ -57,7 +57,7 @@ GET /agents/{name}/sessions/{sid}/history
 Returns every message in the session, ordered chronologically. `kind` is the
 class name of the message (`UserText`, `AssistantText`, `ToolCall`,
 `ToolResult`, `UploadMessage`, `SharedFile`, `SessionContext`,
-`CompactionSummary`, `ProjectAssignmentChanged`).
+`CompactionSummary`, `ProjectAssignmentChanged`, `DateMarker`).
 
 ### Delete a session
 
@@ -205,6 +205,147 @@ per-session capabilities the skill needs but the model must never see:
 specific keys should handle absence explicitly rather than relying on
 the caller.
 
+## Date markers
+
+Long-running sessions tend to confuse the model about time. If a user
+sends a message, then comes back 2 days later and sends another, the
+model's sense of "today" and "yesterday" is still anchored to the
+conversation's earlier turns, not the current wall-clock date.
+
+Ark addresses this at two levels:
+
+### Always-fresh date in the system prompt
+
+The Environment stanza rebuilds per turn with the current date. When
+the client includes `timezone` on their `user_message` frame, that
+zone's local date is shown with UTC in parentheses:
+
+```
+- Today's date (America/Los_Angeles): 2026-10-05  (UTC: 2026-10-06).
+  Your training data has a cutoff; treat this field as the ground
+  truth for "today" and defer to `get_current_time` (returns UTC) when
+  you need the exact wall-clock time.
+```
+
+With no client timezone (UTC default), the line is just
+`Today's date (UTC): 2026-10-05`.
+
+Correctness-level guarantee: the model always has the right date
+visible, independent of history age.
+
+### `DateMarker` injection
+
+When a user turn starts and the calendar date (in the client's
+timezone) differs from the previous `UserText`'s date (same zone), the
+runtime inserts a `DateMarker` row into history **before** persisting
+the new user message. The model sees a synthetic user turn via
+`_rewrite_for_llm`:
+
+> `[system notification: Time has passed since the last turn in this session. The current date is 2026-10-05 (America/Los_Angeles). The previous turn was on 2026-09-29 (6 days ago). Your prior sense of "today", "yesterday", or recent events may be stale — recalibrate accordingly.]`
+
+The explicit "recalibrate" line is the behavioral nudge. A static date
+line in the system prompt tends to be read as background; a synthetic
+turn mid-conversation is louder.
+
+### Timezone semantics
+
+The timezone used for the date comparison is **client-supplied per
+turn** via the `timezone` field on the `user_message` WS frame (IANA
+zone name, e.g. `"America/Los_Angeles"`). The CLI auto-detects the
+system's local zone and sends it on every turn.
+
+Rationale: the timezone is a property of the client at the moment of
+the turn, not of the agent server-side. A user on their phone in NYC
+and their laptop in SF each get correct markers for their current
+location without any server config.
+
+- **Both ends of the comparison** use the current turn's zone — "from
+  the client's current frame of reference, has the date changed?"
+  Simple semantic that handles travel-between-turns cleanly.
+- **Fallback**: absent, invalid, or non-string `timezone` → UTC
+  (unchanged pre-feature behavior).
+- **Persistence**: the `DateMarker` row records the TZ it was computed
+  in, so `/history` and the `date_marker` wire frame expose it.
+  Clients rendering divider UI can show "── Oct 5 (LA time) ──".
+
+### Scope
+
+- **Conversational sessions only.** Cron/heartbeat sessions have their
+  own temporal framing baked into their session kind (they're always
+  "right now").
+- **Calendar-date granularity.** No elapsed-hours trigger — a short gap
+  within the same local day doesn't fire a marker. Date-change is
+  sharp, deterministic, and the right unit for the "I came back later"
+  case.
+- **Previous `UserText` row** is the comparison anchor, not the last
+  message of any kind. Cron-fired `post_to_session` activity between
+  user turns doesn't hide the "user came back" signal.
+
+### What clients see
+
+A real `DateMarker` row in `/history`:
+
+```json
+{
+  "kind": "DateMarker",
+  "data": {
+    "from_date": "2026-09-29",
+    "to_date": "2026-10-05",
+    "elapsed_days": 6,
+    "timezone": "America/Los_Angeles"
+  }
+}
+```
+
+Live `date_marker` WS frame on `/events`:
+
+```json
+{
+  "type": "date_marker",
+  "session_id": "...", "agent_name": "scribe",
+  "from_date": "2026-09-29",
+  "to_date": "2026-10-05",
+  "elapsed_days": 6,
+  "timezone": "America/Los_Angeles",
+  "event_id": 2201
+}
+```
+
+Rendering is the client's call. Common policies:
+
+- **Hide entirely** — filter `kind === "DateMarker"` out of the chat view.
+  Matches how clients typically handle other system markers.
+- **Render as a subtle divider** — `── Oct 5, 2026 (6 days later) ──`
+  between messages, using the structured fields (not the model-facing
+  notification text, which never reaches the client).
+- **Loud banner** — unusual, but possible for an "it's been a while"
+  callout.
+
+The model-facing "[system notification: …]" string exists only in the
+message list sent to the provider. It's not persisted and not returned
+by any read API.
+
+### Sharp edges to know
+
+1. **Backfill**: existing sessions have no markers in history. The first
+   new turn in an old session may fire a marker with an elapsed_days of
+   weeks or months. That's actually desirable — it tells the model about
+   the gap.
+2. **Compaction interaction**: the marker is a durable row. If
+   compaction runs across one, the summarizer sees the synthetic
+   notification in its input and should preserve the "last known date"
+   context (default summarizer prompt preserves significant events).
+3. **No elapsed-time trigger**. If a session stays idle for 20 hours
+   within the same UTC date (common for US-timezone users spanning an
+   evening break), no marker fires. If this becomes a problem in
+   practice, an elapsed-time trigger can be added later as a separate
+   option.
+4. **Timezone**: the marker's `from_date`/`to_date` are in whatever
+   zone the client supplied on the `user_message` frame (`timezone`
+   field). Clients that render the divider can either use the stored
+   date strings as-is or re-convert from the matching `UserText` row's
+   `created_at` + their own current zone.
+
 ## The event stream (unified per-client)
 
 Ark exposes a **single WebSocket per client** that carries events for every
@@ -240,6 +381,7 @@ right session.
 | `compaction_failed` | `code`, `message`, `reason` | Summarizer call errored |
 | `compaction_skipped` | `reason`, `input_tokens`, `context_window` | Threshold crossed but compaction is disabled — warning-only, no action taken |
 | `session_project_changed` | `from_project_id`, `from_project_name`, `to_project_id`, `to_project_name`, `changed_at` | A session's project binding changed (see [projects.md § Reassigning a session's project](projects.md#reassigning-a-sessions-project)) |
+| `date_marker` | `from_date`, `to_date`, `elapsed_days` | A UTC-date boundary was crossed since the previous user turn — the "time has passed" cue (see [Date markers](#date-markers) below) |
 | `done` | `stop_reason`, `stopped?` | Whole run-loop finished for that session, awaiting next user input. On classified errors, `stop_reason` is `"error:<code>"`. On a `stop`-triggered cancel, `stop_reason` is `"stopped"` and the event carries `stopped: true`. |
 
 Every event also carries `session_id` and (except for the broad "error" case
@@ -268,6 +410,7 @@ saw via the live stream — no time-window text-hash dedupe required.
 | `compaction_started` / `_failed` / `_skipped` | No (lifecycle markers) | No |
 | `compaction_completed` | Yes (`CompactionSummary`) | **Yes** |
 | `session_project_changed` | Yes (`ProjectAssignmentChanged`) | **Yes** |
+| `date_marker` | Yes (`DateMarker`) | **Yes** |
 | `injected_message` | Yes (`AssistantText` in target session) | **Yes** |
 | `file_available` | Yes (`SharedFile`) | **Yes** |
 | `workspace_file_changed` / `project_file_changed` | No (external FS events) | No |
@@ -305,7 +448,7 @@ different identifier space.
 
 | Command | Required fields | Effect |
 |---|---|---|
-| `user_message` | `session_id`, `text` | Start a new turn in that session. Multiple sessions can have turns running concurrently — events stream back tagged with their `session_id`. |
+| `user_message` | `session_id`, `text`, optional `timezone` (IANA zone, e.g. `"America/Los_Angeles"`) | Start a new turn in that session. Multiple sessions can have turns running concurrently — events stream back tagged with their `session_id`. If `timezone` is included, the server uses it for the [Date markers](#date-markers) comparison and the Environment stanza's "today's date" line (otherwise UTC). Invalid or non-string → silent fallback to UTC. |
 | `stop` | `session_id` | Cancel the in-flight turn for that session. Fire-and-forget: the cancellation lands as a terminal `done {"stopped": true, "stop_reason": "stopped"}` on the events stream. Silent no-op when no turn is running. Also terminates any in-flight `run_command` process group (SIGTERM immediately, SIGKILL after a 5s grace) so long-running shell commands don't outlive the cancel. |
 
 Per-session context is **not** added over the WS — it's a REST operation

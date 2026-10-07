@@ -124,6 +124,32 @@ class RunError:
 
 
 @dataclass
+class DateMarker:
+    """Persisted at turn-start when the calendar date differs from the
+    previous UserText in the session — the "wake up, time has passed" cue
+    for the model after a session has been idle for a day or more.
+
+    `from_date`/`to_date` are ISO YYYY-MM-DD in `timezone` — the zone the
+    current turn's client supplied (or "UTC" if none). Clients can render
+    "── Oct 5 (LA time) ──" style dividers using this field.
+
+    The row lives in history with its own kind so clients can render it as
+    a timeline divider (or filter it out of the chat view, same policy as
+    other system markers). The runtime substitutes it with a synthetic
+    UserText notification via `_rewrite_for_llm` when building the LLM's
+    message list, so the model sees an explicit "time has passed"
+    notification at that point in the conversation.
+
+    Only inserted on `conversational` sessions — cron/heartbeat have their
+    own temporal framing."""
+
+    from_date: str   # ISO YYYY-MM-DD of the previous UserText's date in `timezone`
+    to_date: str     # ISO YYYY-MM-DD of the current date in `timezone`
+    elapsed_days: int
+    timezone: str = "UTC"  # IANA zone name used for the comparison
+
+
+@dataclass
 class ProjectAssignmentChanged:
     """Marker persisted at the moment a session's project assignment changes.
 
@@ -176,6 +202,7 @@ Message = Union[
     RunError,
     CompactionSummary,
     ProjectAssignmentChanged,
+    DateMarker,
 ]
 
 
@@ -309,6 +336,20 @@ class CompactionSkippedEvent:
     context_window: int | None = None
 
 
+@dataclass
+class DateMarkerEvent:
+    """A DateMarker was inserted at the start of this turn — the calendar
+    date changed (in `timezone`) since the previous user turn. Published
+    to the broker so live WS clients can advance their durable cursor
+    (via `event_id`) and render a date divider in their timeline."""
+
+    from_date: str
+    to_date: str
+    elapsed_days: int
+    timezone: str = "UTC"
+    row_id: int | None = None  # messages.id of the DateMarker row
+
+
 ProviderEvent = Union[
     TextDelta, ThinkingDelta, ToolCallEvent, AssistantTurnEnd, TurnUsageEvent
 ]
@@ -325,6 +366,7 @@ RuntimeEvent = Union[
     CompactionCompletedEvent,
     CompactionFailedEvent,
     CompactionSkippedEvent,
+    DateMarkerEvent,
 ]
 
 
@@ -390,6 +432,13 @@ def message_to_row(msg: Message) -> tuple[str, dict[str, Any]]:
             "to_root": msg.to_root,
             "changed_at": msg.changed_at,
         }
+    if isinstance(msg, DateMarker):
+        return "date_marker", {
+            "from_date": msg.from_date,
+            "to_date": msg.to_date,
+            "elapsed_days": msg.elapsed_days,
+            "timezone": msg.timezone,
+        }
     raise TypeError(f"unknown message type: {type(msg).__name__}")
 
 
@@ -449,5 +498,12 @@ def message_from_row(role: str, content: dict[str, Any]) -> Message:
             from_root=content.get("from_root"),
             to_root=content.get("to_root"),
             changed_at=int(content.get("changed_at", 0)),
+        )
+    if role == "date_marker":
+        return DateMarker(
+            from_date=content.get("from_date", ""),
+            to_date=content.get("to_date", ""),
+            elapsed_days=int(content.get("elapsed_days", 0)),
+            timezone=content.get("timezone", "UTC"),
         )
     raise ValueError(f"unknown role: {role}")

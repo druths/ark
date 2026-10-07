@@ -23,6 +23,8 @@ from .types import (
     CompactionSkippedEvent,
     CompactionStartedEvent,
     CompactionSummary,
+    DateMarker,
+    DateMarkerEvent,
     Message,
     Project,
     ProjectAssignmentChanged,
@@ -227,13 +229,19 @@ def system_prompt(
     contexts: list[SessionContext] | None = None,
     project: Project | None = None,
     compaction_summary: str | None = None,
+    client_timezone: str | None = None,
 ) -> str:
     """Build the system prompt.
+
+    `client_timezone` is the IANA zone name the current turn's client
+    supplied (or None/UTC). The Environment stanza's "today's date" line
+    is rendered in that zone, with UTC also shown parenthetically when
+    the two differ.
 
     Layers (top to bottom):
       1. The user's `session_context.md` — agent identity / persona
       2. The Environment stanza — runtime facts (workspace path, available
-         file/shell/upload helpers)
+         file/shell/upload helpers, today's date)
       3. Project framing — only when this session is bound to a project
       4. Any client-supplied SessionContext messages, concatenated in order
       5. Prior-conversation summary — only after a compaction has occurred
@@ -245,11 +253,29 @@ def system_prompt(
         if ctx_path.exists()
         else f"You are {agent.name}, an agent in the Ark harness."
     )
+    from datetime import datetime, timezone as _tz
+    today_utc = datetime.now(_tz.utc).date().isoformat()
+    tz_label = _coerce_tz(client_timezone)
+    if tz_label == "UTC":
+        date_line = (
+            f"- Today's date (UTC): {today_utc}. Your training data has a cutoff; "
+            "treat this field as the ground truth for \"today\" and defer to "
+            "`get_current_time` when you need the exact wall-clock time.\n"
+        )
+    else:
+        local_date = _now_local_date(tz_label)
+        date_line = (
+            f"- Today's date ({tz_label}): {local_date}  (UTC: {today_utc}). "
+            "Your training data has a cutoff; treat this field as the ground "
+            "truth for \"today\" and defer to `get_current_time` (returns UTC) "
+            "when you need the exact wall-clock time.\n"
+        )
     env = (
         "\n\n---\n"
         "Environment (managed by the Ark harness, do not invent paths):\n"
         f"- Your name: {agent.name}\n"
         f"- Your workspace directory: {agent.workspace}\n"
+        f"{date_line}"
         "- File and shell tools (read_file, write_file, list_files, run_command) "
         "operate on real paths on this server. The current working directory for "
         "each tool call is your workspace above. When in doubt about where a file "
@@ -489,17 +515,132 @@ Be complete over concise. The assistant will rely on this summary as its only me
 _LLM_EXCLUDED = (SessionContext, TurnMetrics, RunError, CompactionSummary)
 
 
+def _coerce_tz(name: str | None) -> str:
+    """Return a validated IANA zone name, or 'UTC' if `name` is None,
+    empty, or not parseable. Centralises the per-turn fallback semantics
+    so callers (date-marker + env stanza) can't disagree."""
+    if not name:
+        return "UTC"
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(name)
+        return name
+    except Exception:  # noqa: BLE001
+        return "UTC"
+
+
+def _now_local_date(tz_name: str) -> str:
+    """Current date in the named zone (ISO YYYY-MM-DD). Falls back to UTC
+    if the zone can't be resolved (shouldn't happen if the caller used
+    `_coerce_tz` first, but defensive)."""
+    from datetime import datetime, timezone as _tz
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(tz_name)).date().isoformat()
+    except Exception:  # noqa: BLE001
+        return datetime.now(_tz.utc).date().isoformat()
+
+
+def _maybe_insert_date_marker(
+    conn: sqlite3.Connection, session_id: str, client_tz: str | None = None,
+) -> DateMarkerEvent | None:
+    """If this is a conversational session and the previous UserText's
+    date (as computed in `client_tz`) differs from today's date (same
+    zone), insert a DateMarker row and return a DateMarkerEvent carrying
+    its row_id. Otherwise return None.
+
+    `client_tz` is the IANA zone name the current turn's client supplied
+    (via the `timezone` field on the `user_message` frame). Both ends of
+    the comparison use this zone — "from the client's current frame of
+    reference, has the date changed?" Falls back to UTC when None or
+    unparseable (see `_coerce_tz`).
+
+    Scope limits for v1 — see docs/sessions.md § Date markers:
+    - Conversational sessions only (cron/heartbeat have their own temporal
+      framing baked into their session kind).
+    - Calendar-date granularity only (no elapsed-hour trigger).
+    - Compared against the previous `UserText` row, not just any message
+      (so cron-fired `post_to_session` activity between user turns doesn't
+      hide the "user came back" signal).
+    """
+    from datetime import datetime, timezone as _tz
+
+    tz_name = _coerce_tz(client_tz)
+    kind_row = conn.execute(
+        "SELECT kind FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    if kind_row is None or kind_row["kind"] != "conversational":
+        return None
+    prev = conn.execute(
+        "SELECT created_at FROM messages "
+        "WHERE session_id = ? AND role = 'user' "
+        "ORDER BY seq DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    if prev is None:
+        return None  # first turn — nothing to compare against
+
+    # Interpret BOTH ends in the current turn's zone.
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(tz_name)
+    except Exception:  # noqa: BLE001
+        tz = _tz.utc
+        tz_name = "UTC"
+    prev_date = datetime.fromtimestamp(prev["created_at"] / 1000, tz=tz).date()
+    now_date = datetime.now(tz).date()
+    if prev_date == now_date:
+        return None
+    elapsed = (now_date - prev_date).days
+    marker = DateMarker(
+        from_date=prev_date.isoformat(),
+        to_date=now_date.isoformat(),
+        elapsed_days=elapsed,
+        timezone=tz_name,
+    )
+    row_id = append_message(conn, session_id, marker)
+    return DateMarkerEvent(
+        from_date=marker.from_date,
+        to_date=marker.to_date,
+        elapsed_days=marker.elapsed_days,
+        timezone=marker.timezone,
+        row_id=row_id,
+    )
+
+
+def _date_marker_notification(msg: DateMarker) -> str:
+    """Render a DateMarker as the synthetic user turn the model sees in the
+    LLM message list. Explicit about elapsed time + the recalibration ask
+    so the model doesn't silently continue to treat prior turns' sense of
+    "today" or "yesterday" as still valid. Uses the marker's own timezone
+    (set at insertion time from the client's supplied TZ)."""
+    days = msg.elapsed_days
+    plural = "day" if days == 1 else "days"
+    return (
+        "[system notification: Time has passed since the last turn in this "
+        f"session. The current date is {msg.to_date} ({msg.timezone}). The "
+        f"previous turn was on {msg.from_date} ({days} {plural} ago). Your "
+        "prior sense of \"today\", \"yesterday\", or recent events may be "
+        "stale — recalibrate accordingly.]"
+    )
+
+
 def _rewrite_for_llm(messages: list[Message]) -> list[Message]:
     """Apply per-kind rewrites needed before a message list goes to a provider.
 
-    Currently: substitute ProjectAssignmentChanged markers with synthetic
-    UserText notifications so the model sees the transition as an event at
-    that point in the timeline. (The original marker stays in history for
-    audit + client rendering.)"""
+    - `ProjectAssignmentChanged` → synthetic UserText notification of the
+      project transition.
+    - `DateMarker` → synthetic UserText notification that time has passed
+      since the last user turn.
+
+    The original marker rows stay in history for audit + client rendering;
+    only the LLM-facing message list is rewritten."""
     out: list[Message] = []
     for m in messages:
         if isinstance(m, ProjectAssignmentChanged):
             out.append(UserText(text=_project_change_notification(m)))
+        elif isinstance(m, DateMarker):
+            out.append(UserText(text=_date_marker_notification(m)))
         else:
             out.append(m)
     return out
@@ -712,6 +853,7 @@ async def run_user_turn(
     user_text: str,
     provider_factory=None,
     max_tokens: int | None = None,
+    client_timezone: str | None = None,
 ) -> AsyncIterator[RuntimeEvent]:
     """Persist the user message, then drive the model → tools → model loop.
 
@@ -720,6 +862,11 @@ async def run_user_turn(
     iterations of THIS turn — compaction is not counted) exceeds
     `max_tokens`. Budget precedence: explicit arg > agent.max_turn_tokens
     > DEFAULT_TURN_TOKEN_BUDGET.
+
+    `client_timezone` is the IANA zone name the client supplied on this
+    turn's `user_message` frame (or None/invalid → UTC). Used for the
+    DateMarker comparison and the Environment stanza's "today's date"
+    line. Falls back to UTC via `_coerce_tz`.
     """
 
     # Late-bound provider_factory default (mirrors compact_session) — resolves
@@ -774,6 +921,18 @@ async def run_user_turn(
     if provider_factory is None:
         provider_factory = make_provider
 
+    # Date-change marker: if this is a conversational session and the
+    # calendar date (in the client's zone) differs from the previous
+    # UserText's date, insert a DateMarker before the new user turn.
+    # Model sees "[system notification: time has passed…]" via
+    # `_rewrite_for_llm`; clients see a `DateMarker` row in history + a
+    # `date_marker` wire event. See docs/sessions.md.
+    date_marker_evt = _maybe_insert_date_marker(
+        conn, session_id, client_tz=client_timezone
+    )
+    if date_marker_evt is not None:
+        yield date_marker_evt
+
     append_message(conn, session_id, UserText(text=user_text))
 
     provider_cfg = config.providers[agent.provider]
@@ -805,7 +964,8 @@ async def run_user_turn(
             [m for m in slice_history if not isinstance(m, _LLM_EXCLUDED)]
         )
         system = system_prompt(
-            agent, contexts, project=project, compaction_summary=compaction_text
+            agent, contexts, project=project, compaction_summary=compaction_text,
+            client_timezone=client_timezone,
         )
         active = tools.active_schemas(agent, skills_for_session)
         pending_tool_calls: list[ToolCallEvent] = []
@@ -1096,6 +1256,17 @@ def event_to_wire(evt: RuntimeEvent | Message) -> dict:
             "input_tokens": evt.input_tokens,
             "context_window": evt.context_window,
         }
+    if isinstance(evt, DateMarkerEvent):
+        out = {
+            "type": "date_marker",
+            "from_date": evt.from_date,
+            "to_date": evt.to_date,
+            "elapsed_days": evt.elapsed_days,
+            "timezone": evt.timezone,
+        }
+        if evt.row_id is not None:
+            out["event_id"] = evt.row_id
+        return out
     if isinstance(evt, RunEnd):
         return {"type": "done", "stop_reason": evt.stop_reason}
     if is_dataclass(evt):
@@ -1111,6 +1282,7 @@ async def run_and_publish(
     session_id: str,
     user_text: str,
     max_tokens: int | None = None,
+    client_timezone: str | None = None,
 ) -> None:
     """Drive a user turn and publish each event to the broker.
 
@@ -1122,6 +1294,9 @@ async def run_and_publish(
     `max_tokens` overrides the per-turn token budget for this call. When None
     (the default), the resolution falls back to agent.max_turn_tokens, then
     DEFAULT_TURN_TOKEN_BUDGET.
+
+    `client_timezone` is the IANA zone the client supplied on the
+    `user_message` frame (or None → UTC fallback). See `run_user_turn`.
     """
 
     task = asyncio.current_task()
@@ -1135,6 +1310,7 @@ async def run_and_publish(
             session_id=session_id,
             user_text=user_text,
             max_tokens=max_tokens,
+            client_timezone=client_timezone,
         ):
             wire = event_to_wire(evt)
             wire["session_id"] = session_id

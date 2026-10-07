@@ -1,5 +1,138 @@
 # Changelog
 
+## Unreleased — Date markers in long-running sessions
+
+Long-running conversational sessions tend to confuse the model about
+time: a user sends a message, comes back two days later, sends another,
+and the model's sense of "today" is still anchored to the conversation's
+older turns. This feature addresses that at two levels. See
+[docs/sessions.md § Date markers](docs/sessions.md#date-markers).
+
+### Always-fresh date in the system prompt
+
+The Environment stanza rebuilds per turn with the current date. With a
+client-supplied timezone (see below) it shows the local date + UTC in
+parens:
+
+```
+- Today's date (America/Los_Angeles): 2026-10-05  (UTC: 2026-10-06).
+  Your training data has a cutoff; treat this field as the ground
+  truth for "today"...
+```
+
+Without a timezone, it falls back to `Today's date (UTC): …`.
+
+### `DateMarker` injection
+
+When a user turn starts and the calendar date (in the client's
+timezone) differs from the previous `UserText`'s date, the runtime
+persists a `DateMarker` row before the new user message. The model
+sees a synthetic UserText notification via `_rewrite_for_llm`:
+
+> `[system notification: Time has passed since the last turn... The current date is 2026-10-05 (America/Los_Angeles). The previous turn was on 2026-09-29 (6 days ago). ... recalibrate accordingly.]`
+
+The explicit "recalibrate" nudge is the behavioral lever a static
+system-prompt line can't provide.
+
+### Client-supplied timezone (per turn)
+
+The `user_message` WS frame now accepts an optional `timezone` field
+(IANA zone name — `"America/Los_Angeles"`, `"Europe/London"`, etc.).
+Used for the date-change comparison + env-stanza "today's date" line.
+
+```json
+{
+  "type": "user_message",
+  "session_id": "...",
+  "text": "...",
+  "timezone": "America/Los_Angeles"
+}
+```
+
+- Rationale: timezone is a property of the client at the moment of the
+  turn, not of the agent. Travel + multi-device + future multi-user all
+  work correctly without server config.
+- **Both ends of the date comparison** use the current turn's zone —
+  "from the client's current frame of reference, has the date changed?"
+- **Fallback**: absent / invalid / non-string → UTC (preserves pre-TZ
+  behavior).
+- **Persistence**: the `DateMarker` row records which TZ it was
+  computed in. `/history` and the `date_marker` wire frame both expose
+  it.
+- **CLI**: `ark chat` auto-detects the system's IANA zone (via
+  `/etc/localtime` symlink, falling back to `$TZ`) and sends it on
+  every turn — users get correct date transitions for free.
+
+### Scope limits (v1)
+
+- Conversational sessions only — cron/heartbeat have their own temporal
+  framing.
+- Calendar-date change only — no elapsed-hour trigger (idle but
+  same-local-day doesn't fire).
+- Previous `UserText` row is the comparison anchor — cron-fired
+  `post_to_session` activity between user turns doesn't hide the "user
+  came back" signal.
+
+### New wire shape
+
+Live `date_marker` event on `/events`:
+
+```json
+{
+  "type": "date_marker",
+  "session_id": "...", "agent_name": "scribe",
+  "from_date": "2026-09-29", "to_date": "2026-10-05",
+  "elapsed_days": 6,
+  "timezone": "America/Los_Angeles",
+  "event_id": 2201
+}
+```
+
+`event_id` matches the `DateMarker` row's `messages.id` — durable cursor
+advances uniformly across live + catch-up.
+
+In `/history`, the row appears as `kind: "DateMarker"` with structured
+fields (including `timezone`). Rendering is the client's call: hide,
+subtle divider ("── Oct 5, 2026 (6 days later, LA time) ──"), loud
+banner. The model-facing "[system notification: …]" text never reaches
+the client — only the structured form.
+
+### New types + API additions
+
+- `DateMarker(from_date, to_date, elapsed_days)` message type +
+  round-trip in `message_to_row` / `message_from_row`.
+- `DateMarkerEvent(from_date, to_date, elapsed_days, row_id)` runtime
+  event with wire conversion.
+- `runtime._maybe_insert_date_marker(conn, session_id)` — fires at
+  `run_user_turn` entry.
+- `runtime._date_marker_notification(msg)` — renders the LLM-facing
+  text.
+- `_rewrite_for_llm` substitutes `DateMarker` → synthetic UserText.
+- `system_prompt` env stanza always carries today's UTC date.
+
+### Sharp edges
+
+- **Backfill**: existing sessions have no markers. The first turn in an
+  old session may fire a marker with a large `elapsed_days` — desired,
+  tells the model about the gap.
+- **Compaction interaction**: default summarizer preserves significant
+  events; the marker should carry forward naturally.
+- **No elapsed-hour trigger**. Same-UTC-day idle periods don't fire.
+  Add as a follow-on if needed.
+- **UTC** means the "date change" happens at a different wall-clock
+  time depending on local TZ. Clients rendering local-date dividers may
+  want to transform `to_date`.
+
+### Tests
+
+`tests/test_date_marker.py` (14): round-trip, env-stanza date presence,
+insertion fires on date change, skips same-day / first turn /
+cron+heartbeat kinds / non-UserText anchor, `_rewrite_for_llm`
+substitution + synthetic-user-text text, wire format with/without
+`event_id`, end-to-end runtime yields `DateMarkerEvent` + LLM sees
+notification + system prompt has today's date, baseline back-to-back
+same-day case fires no marker.
+
 ## Unreleased — `event_id` on live WS events for durable-cursor dedupe
 
 Live `/events` WS frames that correspond to a persisted `messages` row

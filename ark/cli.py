@@ -38,6 +38,31 @@ def _headers(secret: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {secret}"}
 
 
+def _detect_local_timezone() -> str | None:
+    """Best-effort detection of the local IANA timezone name — "America/
+    Los_Angeles", "Europe/London", etc. Sent on each `user_message` frame
+    so the server's date-change marker lines up with the user's wall
+    clock, not UTC. Returns None if we can't determine it with confidence
+    (server falls back to UTC).
+
+    Approach: on macOS and most Linux distros, /etc/localtime is a
+    symlink to a file under /usr/share/zoneinfo/… or
+    /var/db/timezone/zoneinfo/…; the tail of the link path is the IANA
+    name. Fall back to the TZ env var if set."""
+    import os
+    try:
+        link = os.readlink("/etc/localtime")
+        for marker in ("/zoneinfo/", "/zoneinfo.default/"):
+            if marker in link:
+                return link.split(marker, 1)[1]
+    except OSError:
+        pass
+    tz_env = os.environ.get("TZ")
+    if tz_env and "/" in tz_env:
+        return tz_env
+    return None
+
+
 # ---------------------------------------------------------------------------
 # agents
 # ---------------------------------------------------------------------------
@@ -454,15 +479,15 @@ async def _chat(
                         continue
                     turn_done.clear()
                     ui.status("thinking")
-                    await ws.send(
-                        json.dumps(
-                            {
-                                "type": "user_message",
-                                "session_id": session_id,
-                                "text": text,
-                            }
-                        )
-                    )
+                    frame: dict[str, Any] = {
+                        "type": "user_message",
+                        "session_id": session_id,
+                        "text": text,
+                    }
+                    local_tz = _detect_local_timezone()
+                    if local_tz:
+                        frame["timezone"] = local_tz
+                    await ws.send(json.dumps(frame))
 
             await asyncio.gather(reader(), writer())
     return 0
