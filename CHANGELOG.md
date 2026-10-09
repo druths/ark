@@ -1,5 +1,90 @@
 # Changelog
 
+## Unreleased — Phase 1 multi-modal: inbound images via `view_media`
+
+Agents can now show images to the model. Tool-centric design: the agent
+explicitly calls `view_media(path)` when it wants the model to perceive
+an image (symmetric with `read_file` for text). No upload auto-attach,
+no manifest filtering per model, no capability table — the agent asks,
+the runtime routes bytes through the provider's native multimodal
+content block, and the model's vision tower does the actual perception.
+
+See [docs/sessions.md § Multi-modal input](docs/sessions.md#multi-modal-input)
+for the full design.
+
+### The `view_media` tool
+
+```python
+view_media(path: str) -> str
+```
+
+Validates the file exists, detects mime (magic bytes + extension),
+appends an attachment entry to `current_context().pending_attachments`,
+returns a text ack. The runtime drains the attachment list after the
+tool returns and folds it into the `ToolResult` row.
+
+**v1 supports**: PNG, JPEG, WebP, GIF.
+**Rejects**: everything else with a clear error pointing at the
+capability horizon (PDF/audio/video land in later phases).
+
+### Where attachments go on the wire
+
+Each provider adapter learned a new translation for `ToolResult` rows
+carrying attachments:
+
+| Provider | Native shape |
+|---|---|
+| **Anthropic** | `tool_result` content array mixing text + image blocks |
+| **OpenAI / OpenRouter** | tool_result (text) followed by a user message with `image_url` blocks (data: URL — no transient hosting). OpenRouter routes to the backend model's native shape automatically. |
+| **Gemini** | `FunctionResponse` followed by a user `Content` with `inline_data` parts |
+
+Pure-text `ToolResult` rows keep their old wire shape unchanged
+(no regression for existing tools).
+
+### Dynamic capability
+
+No capability table, no catalog fetch, no agent config override.
+If `view_media` is called on a model that can't process images
+(text-only model), the provider's rejection surfaces as a normal
+provider error with the provider's own message. Agent learns + recovers.
+
+### Type system additions
+
+- `ToolResult.attachments: list[dict]` — new optional field.
+  Round-trip: present only when non-empty (keeps legacy rows tiny).
+- `ToolContext.pending_attachments: list[dict] | None` — new scratchpad
+  the tool populates and the runtime drains.
+
+Both default empty / None, so every existing construction site keeps
+working.
+
+### Tests
+
+`tests/test_view_media.py` (18): tool contract (png/jpeg detection,
+missing-file + unsupported-type errors), `ToolResult` round-trip +
+backwards-compat (empty attachments omitted from wire; legacy rows
+load as empty), shared image-block builders per provider (base64
+round-trip, non-existent file returns None, non-image type returns
+None), Anthropic tool_result uses content-array shape with
+mixed-content, OpenAI emits follow-up user message with image_url +
+text pointer, Gemini emits follow-up user Content with text +
+inline_data parts, end-to-end runtime drains pending_attachments into
+the ToolResult row + the next iteration's message list carries it.
+
+### What's deliberately not in Phase 1
+
+- **Model-generated media output** (Gemini image gen, GPT-4o audio) —
+  separate phase; needs new message/event types and per-adapter stream
+  parsing.
+- **PDFs** (Phase 2) — Anthropic + Gemini have native support,
+  OpenAI needs conversion first. Capability check extends, tool
+  surface unchanged.
+- **Audio** (Phase 3) — OpenAI + Gemini native; Anthropic doesn't.
+- **Video** (Phase 4) — Gemini only.
+- **MCP-returned images** — the MCP integration still drops image
+  content from tool results; once Phase 1 is proven, the MCP path
+  piggybacks on the same `ToolResult.attachments` mechanism.
+
 ## Unreleased — Date markers in long-running sessions
 
 Long-running conversational sessions tend to confuse the model about

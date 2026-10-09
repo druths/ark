@@ -7,7 +7,7 @@ provider adapter is responsible for translating to/from its native format.
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Union
 
 # ---------------------------------------------------------------------------
@@ -43,6 +43,12 @@ class ToolResult:
     output: str
     is_error: bool = False
     name: str = ""  # name of the tool that produced this result (required by Google's API)
+    # Optional media attachments the tool produced (image/pdf/audio/video).
+    # Each entry: {"type": "image" | "pdf" | ..., "path": "<fs path>", "mime": "image/png"}.
+    # Provider adapters read these at message-list build time and translate
+    # to the provider's native tool_result-with-media content shape. See
+    # the view_media built-in tool and docs/sessions.md § Multi-modal.
+    attachments: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -397,6 +403,8 @@ def message_to_row(msg: Message) -> tuple[str, dict[str, Any]]:
         }
         if msg.name:
             body["name"] = msg.name
+        if msg.attachments:
+            body["attachments"] = list(msg.attachments)
         return "tool_result", body
     if isinstance(msg, UploadMessage):
         return "upload", {
@@ -462,6 +470,7 @@ def message_from_row(role: str, content: dict[str, Any]) -> Message:
             output=content["output"],
             is_error=content.get("is_error", False),
             name=content.get("name", ""),
+            attachments=list(content.get("attachments") or []),
         )
     if role == "upload":
         return UploadMessage(

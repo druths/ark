@@ -33,6 +33,89 @@ from .types import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Multimodal attachment loading (shared across all three provider adapters)
+# ---------------------------------------------------------------------------
+#
+# Attachments on ToolResult rows carry a filesystem path, not inline bytes.
+# At message-list build time we read + base64-encode on demand. Keeping
+# bytes out of the DB keeps rows small; the file lives on disk anyway
+# (uploaded via /uploads or written by a tool).
+#
+# These helpers return provider-native content blocks for an {image, path,
+# mime} attachment dict, or None if the file can't be read or the type
+# isn't image. PDF/audio/video land in later phases.
+
+
+def _load_attachment_bytes(att: dict[str, Any]) -> tuple[bytes, str] | None:
+    """Read `att["path"]` and return (bytes, mime) — or None if the file
+    doesn't exist or the attachment metadata is malformed. Called by each
+    provider adapter's block translator."""
+    from pathlib import Path as _Path
+
+    path = att.get("path")
+    mime = att.get("mime")
+    if not path or not mime:
+        return None
+    p = _Path(path)
+    if not p.is_file():
+        return None
+    try:
+        return p.read_bytes(), str(mime)
+    except OSError:
+        return None
+
+
+def _anthropic_image_block(att: dict[str, Any]) -> dict[str, Any] | None:
+    """Build Anthropic's image content block from an attachment dict.
+    Returns None if the attachment can't be loaded or isn't an image."""
+    import base64 as _b64
+
+    if att.get("type") != "image":
+        return None
+    loaded = _load_attachment_bytes(att)
+    if loaded is None:
+        return None
+    data, mime = loaded
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": mime,
+            "data": _b64.b64encode(data).decode("ascii"),
+        },
+    }
+
+
+def _openai_image_block(att: dict[str, Any]) -> dict[str, Any] | None:
+    """Build OpenAI/OpenRouter's image_url content block from an attachment
+    dict. Uses a data: URL (base64-inline) so there's no transient URL
+    hosting required. Returns None if the attachment can't be loaded or
+    isn't an image."""
+    import base64 as _b64
+
+    if att.get("type") != "image":
+        return None
+    loaded = _load_attachment_bytes(att)
+    if loaded is None:
+        return None
+    data, mime = loaded
+    data_url = f"data:{mime};base64,{_b64.b64encode(data).decode('ascii')}"
+    return {"type": "image_url", "image_url": {"url": data_url}}
+
+
+def _google_image_part(att: dict[str, Any]) -> Any | None:
+    """Build a Gemini `Part` carrying an image, from an attachment dict.
+    Returns None if the attachment can't be loaded or isn't an image."""
+    if att.get("type") != "image":
+        return None
+    loaded = _load_attachment_bytes(att)
+    if loaded is None:
+        return None
+    data, mime = loaded
+    return gtypes.Part(inline_data=gtypes.Blob(mime_type=mime, data=data))
+
+
 def _upload_marker(msg: UploadMessage) -> str:
     return (
         f"[user attached a file: original name '{msg.original_name}', "
@@ -162,11 +245,29 @@ def to_anthropic_messages(messages: list[Message]) -> list[dict[str, Any]]:
             blocks = []
             while i < n and isinstance(messages[i], ToolResult):
                 tr = messages[i]
-                block: dict[str, Any] = {
-                    "type": "tool_result",
-                    "tool_use_id": tr.call_id,
-                    "content": tr.output,
-                }
+                # Multimodal: if the tool attached media (via view_media),
+                # Anthropic's tool_result accepts a `content` array mixing
+                # text + image blocks. Pure-text results stay as a bare
+                # string for the common case.
+                if tr.attachments:
+                    content_parts: list[dict[str, Any]] = [
+                        {"type": "text", "text": tr.output or ""}
+                    ]
+                    for att in tr.attachments:
+                        img = _anthropic_image_block(att)
+                        if img is not None:
+                            content_parts.append(img)
+                    block: dict[str, Any] = {
+                        "type": "tool_result",
+                        "tool_use_id": tr.call_id,
+                        "content": content_parts,
+                    }
+                else:
+                    block = {
+                        "type": "tool_result",
+                        "tool_use_id": tr.call_id,
+                        "content": tr.output,
+                    }
                 if tr.is_error:
                     block["is_error"] = True
                 blocks.append(block)
@@ -380,6 +481,23 @@ def to_openai_messages(system: str, messages: list[Message]) -> list[dict[str, A
                     "content": m.output if not m.is_error else f"ERROR: {m.output}",
                 }
             )
+            # Multimodal: OpenAI's `tool` role content is text-only, so an
+            # image attached by the tool goes out as a FOLLOW-UP user message
+            # (image blocks + a short text pointer back to the tool_call_id)
+            # right after the tool_result. OpenRouter translates this to the
+            # routed model's native shape (e.g., Anthropic's image blocks on
+            # a user turn). Also covers any OpenAI-compatible gateway.
+            if m.attachments:
+                content_parts: list[dict[str, Any]] = [
+                    {"type": "text",
+                     "text": f"[attached by tool_call {m.call_id}]"}
+                ]
+                for att in m.attachments:
+                    img = _openai_image_block(att)
+                    if img is not None:
+                        content_parts.append(img)
+                if len(content_parts) > 1:
+                    out.append({"role": "user", "content": content_parts})
             i += 1
         else:  # pragma: no cover
             raise TypeError(f"unknown message: {type(m).__name__}")
@@ -559,6 +677,10 @@ def to_google_contents(messages: list[Message]) -> list[Any]:
                 out.append(gtypes.Content(role="model", parts=parts))
         elif isinstance(m, ToolResult):
             parts = []
+            # Collect any image attachments across this ToolResult cluster;
+            # Gemini's FunctionResponse is text-only, so we emit image parts
+            # in a FOLLOW-UP user Content block immediately after.
+            follow_up_media: list[Any] = []
             while i < n and isinstance(messages[i], ToolResult):
                 tr = messages[i]
                 # Google's API requires a non-empty `name` on every FunctionResponse.
@@ -577,8 +699,22 @@ def to_google_contents(messages: list[Message]) -> list[Any]:
                         )
                     )
                 )
+                for att in tr.attachments or []:
+                    part = _google_image_part(att)
+                    if part is not None:
+                        follow_up_media.append(part)
                 i += 1
             out.append(gtypes.Content(role="user", parts=parts))
+            if follow_up_media:
+                # Prepend a short text part so the model has context for the
+                # loose images arriving on a user turn — otherwise it may
+                # ignore them. Gemini accepts mixed text + inline_data parts
+                # in a single user Content.
+                out.append(gtypes.Content(
+                    role="user",
+                    parts=[gtypes.Part(text="[attached by prior tool_result]")]
+                          + follow_up_media,
+                ))
         else:  # pragma: no cover
             raise TypeError(f"unknown message: {type(m).__name__}")
     return out

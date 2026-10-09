@@ -1105,12 +1105,19 @@ async def run_user_turn(
             metadata=session_metadata(conn, session_id),
         )
         for tc in pending_tool_calls:
+            # Clear any stale attachments before dispatch; the tool may append
+            # fresh entries via `current_context().pending_attachments` (see
+            # the view_media built-in). We drain after execute returns.
+            ctx.pending_attachments = []
             output, is_error = await tools.execute(tc.name, tc.input, ctx=ctx)
+            attachments = list(ctx.pending_attachments or [])
+            ctx.pending_attachments = []
             result_id = append_message(
                 conn,
                 session_id,
                 ToolResult(
-                    call_id=tc.id, output=output, is_error=is_error, name=tc.name
+                    call_id=tc.id, output=output, is_error=is_error,
+                    name=tc.name, attachments=attachments,
                 ),
             )
             yield ToolResultEvent(

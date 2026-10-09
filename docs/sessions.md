@@ -645,6 +645,104 @@ client sees `done` with `stop_reason: "max_tokens"`. No `RunError`.
 Clients that want to make truncation visible can special-case that
 `stop_reason` in their UI.
 
+## Multi-modal input
+
+Phase 1 ships inbound image support via a built-in tool. The agent sees
+images only when it explicitly chooses to — this is tool-centric
+(symmetric with `read_file` for text), not upload-centric (no automatic
+"here's everything the user has shown you" attached per turn).
+
+### The `view_media` tool
+
+```python
+view_media(path: str)
+```
+
+Loads a file from disk and attaches it to the current tool call's result.
+On the next iteration, the model perceives the image through its
+provider's native multimodal content block. Returns a short text
+acknowledgment of what was attached (size, mime). The model doesn't
+see raw bytes — the perception happens outside the LM, in the
+provider's vision pipeline.
+
+**Supported types in v1**: images only — PNG, JPEG, WebP, GIF. PDF /
+audio / video coming in later phases. Unsupported mime types return a
+`ToolError` with the capability horizon.
+
+**File location**: anywhere the agent can read — typically `uploads/`
+(where client-uploaded files land) or the agent's own workspace output
+dirs (where it saved something earlier). Both absolute and
+workspace-relative paths work.
+
+### How it flows end-to-end
+
+1. User uploads `mockup.png` via `POST /uploads/mockup.png`. An
+   `UploadMessage` row lands in history naming the file (same as
+   today).
+2. The agent reads its message list, notices the upload, decides to
+   look. Calls `view_media("uploads/mockup.png")`.
+3. The tool validates the file exists, detects the mime, registers the
+   attachment on `current_context().pending_attachments`, returns a
+   text ack.
+4. The runtime drains the attachment list after the tool returns and
+   folds it into the `ToolResult` row's `attachments` field (persisted
+   alongside the row's text output).
+5. On the next model iteration, the provider adapter translates the
+   `ToolResult`-with-attachment into the provider's native shape:
+   - **Anthropic**: `tool_result` content array with mixed text + image blocks.
+   - **OpenAI / OpenRouter**: tool_result (text) followed by a user message with `image_url` blocks (data: URL, no transient hosting).
+   - **Gemini**: `FunctionResponse` followed by a user `Content` with `inline_data` parts.
+6. Model perceives the image via its vision tower and reasons about
+   what it sees. Normal `assistant_message` follows.
+
+### Why tool-centric
+
+- **Lazy / token-efficient**: user uploads 10 screenshots to show
+  different app states, agent only looks at the 2 relevant to its task.
+  The other 8 never consume vision tokens.
+- **Agent-controlled**: no runtime magic about "attach any upload since
+  the last turn" with its edge cases.
+- **Compacts naturally**: image-carrying `ToolResult` rows compact the
+  same way text ones do — the summarizer sees the text ack ("attached
+  mockup.png"), the image bytes drop. No special compaction policy for
+  images.
+- **One mechanism for three use cases**: user uploads + agent exploring
+  workspace + MCP-returned images (coming in later phases) all flow
+  through the same `ToolResult.attachments` pipeline.
+
+### Dynamic capability — no table, no catalog fetch
+
+Ark doesn't maintain a model-capability matrix. If the agent calls
+`view_media` on a model that can't process images (text-only model),
+the provider rejects the next call with its own error message
+(something like *"this model doesn't accept image inputs"*), surfaced
+to the agent as a normal provider error. Agent learns + recovers. No
+upfront validation, no stale hardcoded tables, no catalog syncing.
+
+### Why not a format-specific tool (`view_image`, `view_pdf`, …)?
+
+Single tool keeps the manifest smaller, the agent's mental model
+simpler, and future format additions zero-churn — adding PDF support
+in Phase 2 is a server-side `_SUPPORTED_MEDIA_MIMES_V1` extension plus
+adapter translation; the tool API doesn't change.
+
+The tool's docstring tells the agent what's currently supported and
+what to do when the model can't process the type ("don't retry with
+the same media; find a text-based alternative").
+
+### What's NOT in Phase 1
+
+- **PDFs** (Phase 2) — Anthropic + Gemini have native support, OpenAI needs conversion first.
+- **Audio** (Phase 3) — OpenAI + Gemini have native support, Anthropic doesn't.
+- **Video** (Phase 4) — Gemini only.
+- **Model-generated media outbound** (separate phase) — e.g., Gemini
+  2.5 image generation inline in response streams. Needs new message
+  types + wire events + per-adapter stream parsing.
+- **MCP-returned images** (follow-on) — the MCP integration currently
+  drops image content from tool results. Once Phase 1 is proven, the
+  MCP tool-result path piggybacks on the same `ToolResult.attachments`
+  mechanism.
+
 ## Compaction
 
 When a session grows large, Ark automatically summarizes prior turns into a

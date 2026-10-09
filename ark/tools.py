@@ -42,6 +42,11 @@ class ToolContext:
     # unforgeable server-side channel as session_id — never model-visible.
     # Skills read per-session capabilities from here (e.g. a callback pair).
     metadata: dict | None = None
+    # Scratchpad a tool can append media attachments to during its invocation.
+    # The runtime drains this list into the ToolResult's `attachments` field
+    # after the tool returns, then clears it. See the view_media built-in.
+    # Each entry: {"type": "image" | "pdf" | ..., "path": "...", "mime": "..."}.
+    pending_attachments: list[dict] | None = None
 
 
 _context: ContextVar[ToolContext] = ContextVar("ark_tool_context")
@@ -923,6 +928,108 @@ _register(
 
 
 # ---------------------------------------------------------------------------
+# Multi-modal input: attach a media file to this tool call's result so the
+# model perceives it on the next iteration (via the provider's native
+# multimodal content block — image_block for Anthropic, image_url for OpenAI
+# etc.). Images only in v1; PDFs/audio/video land as separate phases.
+# ---------------------------------------------------------------------------
+
+# Media types v1 can route to a provider. The runtime doesn't check the
+# model's actual capability here — if the provider rejects the next call
+# because the model doesn't accept this media type, that error bubbles up
+# as a normal provider error with the provider's own message. Dynamic
+# capability signaling without a hardcoded capability table.
+_SUPPORTED_MEDIA_MIMES_V1 = {
+    "image/png": "image",
+    "image/jpeg": "image",
+    "image/webp": "image",
+    "image/gif": "image",
+}
+
+
+def _detect_mime(path: Path) -> str:
+    """Best-effort mime from magic bytes, falling back to extension. Standard
+    library `mimetypes` works for extensions; we check magic bytes for a few
+    common image formats to catch misnamed files."""
+    import mimetypes
+
+    try:
+        with path.open("rb") as f:
+            head = f.read(16)
+    except OSError:
+        head = b""
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith(b"RIFF") and len(head) >= 12 and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
+        return "image/gif"
+    mime, _ = mimetypes.guess_type(str(path))
+    return mime or "application/octet-stream"
+
+
+def _view_media(*, path: str) -> str:
+    """Attach a media file to this tool call's result so the model perceives
+    it on the next iteration. v1: images only (PNG/JPEG/WebP/GIF).
+
+    Appends to `current_context().pending_attachments`; the runtime drains
+    that list into the ToolResult's `attachments` field after the tool
+    returns. Returns a short text ack describing what was attached.
+    """
+    ctx = current_context()
+    full = Path(path).expanduser()
+    if not full.is_file():
+        raise ToolError(f"not a file: {path}")
+    mime = _detect_mime(full)
+    kind = _SUPPORTED_MEDIA_MIMES_V1.get(mime)
+    if kind is None:
+        raise ToolError(
+            f"unsupported media type {mime!r} for v1 — images only "
+            "(PNG/JPEG/WebP/GIF). PDF/audio/video coming in later phases."
+        )
+    # Register the attachment on the context — the runtime will fold it
+    # into the ToolResult the provider sees on the next iteration.
+    if ctx.pending_attachments is None:
+        ctx.pending_attachments = []
+    ctx.pending_attachments.append(
+        {"type": kind, "path": str(full.resolve()), "mime": mime}
+    )
+    size = full.stat().st_size
+    return (
+        f"attached {kind} {full.name!r} ({mime}, {size} bytes) to this "
+        "tool call's result; the model will see it on the next iteration"
+    )
+
+
+_register(
+    ToolSchema(
+        name="view_media",
+        description=(
+            "Load a media file and attach it to this tool call's result so "
+            "the model perceives it on the next iteration. Use this when you "
+            "need the model to actually SEE an image (rather than just "
+            "reading its path or filename). `path` can be absolute or "
+            "workspace-relative. Currently supports images only: PNG, JPEG, "
+            "WebP, GIF. Audio, video, and PDF support may follow. If the "
+            "model your agent is running on can't process this media type, "
+            "the next provider call will error — don't retry with the same "
+            "media; find a text-based alternative."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+            },
+            "required": ["path"],
+        },
+    ),
+    _view_media,
+)
+
+
+# ---------------------------------------------------------------------------
 # Skill meta-tools
 # ---------------------------------------------------------------------------
 
@@ -1096,6 +1203,14 @@ def schemas() -> list[ToolSchema]:
 
 
 async def execute(name: str, args: dict[str, Any], *, ctx: ToolContext) -> tuple[str, bool]:
+    """Run a tool. Returns `(output_text, is_error)`.
+
+    Media attachments the tool registered via `ctx.pending_attachments`
+    (see view_media) are left on the context object for the caller to
+    drain. Keeping the return signature 2-tuple preserves backwards
+    compatibility with all existing callers (including every skill-
+    testing seam).
+    """
     # MCP-backed tools take a different path — no cwd change, no contextvar
     # (external process; no notion of Ark's current session).
     mcp_target = _resolve_mcp(name, ctx.agent, ctx.loaded_skills)
