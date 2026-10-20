@@ -429,6 +429,68 @@ def test_shared_file_wire_omits_defaults():
 
 
 # ---------------------------------------------------------------------------
+# CLI: _download_shared routes to the right endpoint based on `root`
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cli_download_shared_workspace_hits_agent_files(tmp_path):
+    """Default (root='workspace'): fetch via /agents/{agent}/files/<path>."""
+    import httpx
+    from ark.cli import _download_shared
+
+    seen: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req.url.path)
+        return httpx.Response(200, content=b"hello")
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as http:
+        out = await _download_shared(http, "scribe", "chart.png", tmp_path)
+    assert seen == ["/agents/scribe/files/chart.png"]
+    assert out.read_bytes() == b"hello"
+
+
+@pytest.mark.asyncio
+async def test_cli_download_shared_project_hits_project_files(tmp_path):
+    """root='project' + project_id: fetch via /projects/{pid}/files/<path>,
+    not the agent-workspace endpoint (which would 404)."""
+    import httpx
+    from ark.cli import _download_shared
+
+    seen: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req.url.path)
+        return httpx.Response(200, content=b"pdfbytes")
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as http:
+        out = await _download_shared(
+            http, "scribe", "Q3-report.pdf", tmp_path,
+            root="project", project_id="abc-123",
+        )
+    assert seen == ["/projects/abc-123/files/Q3-report.pdf"]
+    assert out.read_bytes() == b"pdfbytes"
+
+
+@pytest.mark.asyncio
+async def test_cli_download_shared_project_without_id_errors(tmp_path):
+    """A root='project' frame with no project_id is a malformed event; the
+    client refuses rather than silently falling back to the workspace URL."""
+    import httpx
+    from ark.cli import _download_shared
+
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, content=b""))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as http:
+        with pytest.raises(ValueError, match="project_id"):
+            await _download_shared(
+                http, "scribe", "x.md", tmp_path, root="project", project_id=None,
+            )
+
+
+# ---------------------------------------------------------------------------
 # Provider folding for the new message types
 # ---------------------------------------------------------------------------
 

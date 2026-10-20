@@ -291,7 +291,13 @@ async def _upload_one(
 
 
 async def _download_shared(
-    http: httpx.AsyncClient, agent: str, path: str, dest_dir: Path
+    http: httpx.AsyncClient,
+    agent: str,
+    path: str,
+    dest_dir: Path,
+    *,
+    root: str = "workspace",
+    project_id: str | None = None,
 ) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     name = Path(path).name
@@ -301,7 +307,13 @@ async def _download_shared(
     while target.exists():
         target = dest_dir / f"{Path(name).stem}-{i}{Path(name).suffix}"
         i += 1
-    async with http.stream("GET", f"/agents/{agent}/files/{path}") as r:
+    if root == "project":
+        if not project_id:
+            raise ValueError("file_available root='project' missing project_id")
+        url = f"/projects/{project_id}/files/{path}"
+    else:
+        url = f"/agents/{agent}/files/{path}"
+    async with http.stream("GET", url) as r:
         r.raise_for_status()
         with target.open("wb") as out:
             async for chunk in r.aiter_bytes(64 * 1024):
@@ -503,8 +515,12 @@ async def _on_file_available(
     path = evt.get("path", "")
     size = evt.get("size", 0)
     desc = evt.get("description", "")
+    root = evt.get("root", "workspace")
+    project_id = evt.get("project_id")
     try:
-        local = await _download_shared(http, agent, path, dl_dir)
+        local = await _download_shared(
+            http, agent, path, dl_dir, root=root, project_id=project_id,
+        )
         suffix = f" — {desc}" if desc else ""
         ui.error_line(f"[agent shared {path} ({size} bytes) → {local}{suffix}]")
     except Exception as e:  # noqa: BLE001

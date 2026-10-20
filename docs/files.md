@@ -117,7 +117,13 @@ publishes a WebSocket event to every client connected to that session:
 `path` is relative to `root`. For `root: "workspace"` (the default),
 fetch via `GET /agents/{name}/files/<path>` as above. For
 `root: "project"` the frame also carries `project_id`, and clients
-fetch via `GET /projects/{project_id}/files/<path>`:
+fetch via `GET /projects/{project_id}/files/<path>`. **Clients must
+branch on `root` when building the download URL** — using the
+workspace URL for a project file 404s (the file isn't in the
+agent's workspace); using the project URL for a workspace file
+also fails for the same reason. The built-in CLI
+([ark/cli.py:_download_shared](../ark/cli.py)) is the reference
+implementation.
 
 ```json
 {

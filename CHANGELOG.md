@@ -74,14 +74,27 @@ side.
 Updated to explain the dual-root behavior so the model picks it up
 through its tool manifest without needing persona changes.
 
+### CLI download routing
+
+`ark chat`'s `_download_shared` previously always fetched via
+`/agents/{agent}/files/<path>`, so a `file_available` with
+`root: "project"` 404'd. Now branches on `root` and hits
+`/projects/{project_id}/files/<path>` for project-root shares.
+External UIs that render `file_available` events (previews,
+inline downloads) must do the same — the frame's `root` is the
+discriminator; see [docs/files.md](docs/files.md#websocket-event-file_available).
+
 ### Tests
 
-`tests/test_file_transfer.py` gained 7 cases: absolute path under
+`tests/test_file_transfer.py` gained 10 cases: absolute path under
 workspace, absolute path under project root (persist + broker frame
 shape), absolute path outside both (rejected with clear error),
 absolute path when session has no project binding (specific error
 wording), round-trip backwards-compat on legacy rows, round-trip of
-new fields, wire-shape omits defaults.
+new fields, wire-shape omits defaults, plus CLI download routing
+(workspace hits agent-files URL, project hits project-files URL,
+project frame missing `project_id` raises rather than silently
+falling back).
 
 ## Unreleased — Phase 1 multi-modal: inbound images via `view_media`
 
