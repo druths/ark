@@ -1,5 +1,88 @@
 # Changelog
 
+## Unreleased — `share_with_client` now shares project-root files directly
+
+Previously `share_with_client` only accepted workspace-relative paths —
+sharing a file written in a project root required copying it into the
+agent's workspace first. Now accepts absolute paths that resolve under
+either the agent's workspace OR the current session's bound project
+root; the file stays where it is and the client fetches it from the
+matching download endpoint.
+
+### Resolution rules
+
+- **Relative path** (e.g. `report.pdf`) → resolved under workspace.
+  Unchanged behavior.
+- **Absolute path under agent workspace** → OK, `root: "workspace"`.
+- **Absolute path under session's bound project root** → OK,
+  `root: "project"`, event + row carry `project_id`.
+- **Absolute path outside both** → `ToolError` naming the specific
+  trust boundary ("outside workspace, no project binding" when the
+  session isn't project-bound; "outside both workspace and project
+  root" when it is).
+
+Keeps the trust boundary scoped — the agent can only share from places
+it legitimately operates in.
+
+### Schema change
+
+`SharedFile` gains two optional fields:
+
+```python
+@dataclass
+class SharedFile:
+    path: str
+    description: str = ""
+    size: int = 0
+    root: str = "workspace"             # NEW: "workspace" | "project"
+    project_id: str | None = None       # NEW: populated when root == "project"
+```
+
+**Backwards-compat**: both fields are omitted from the serialized form
+when they're at their defaults — existing rows load as before. New
+rows for the workspace case are byte-identical on disk to the old
+format.
+
+### Wire shape
+
+`file_available` now carries `root`; when `root: "project"` it also
+carries `project_id` so clients know which endpoint to hit:
+
+```json
+{
+  "type": "file_available",
+  "session_id": "...", "agent_name": "scribe",
+  "path": "Q3-report.pdf",
+  "description": "quarterly",
+  "size": 262144,
+  "root": "project",
+  "project_id": "abc-123",
+  "event_id": 12345
+}
+```
+
+Client download:
+- `root: "workspace"` → `GET /agents/{name}/files/{path}` (today's URL)
+- `root: "project"` → `GET /projects/{project_id}/files/{path}`
+
+Clients that don't know about `root` keep working — the workspace-case
+URL is unchanged, and absent `root` defaults to workspace on their
+side.
+
+### Tool docstring
+
+Updated to explain the dual-root behavior so the model picks it up
+through its tool manifest without needing persona changes.
+
+### Tests
+
+`tests/test_file_transfer.py` gained 7 cases: absolute path under
+workspace, absolute path under project root (persist + broker frame
+shape), absolute path outside both (rejected with clear error),
+absolute path when session has no project binding (specific error
+wording), round-trip backwards-compat on legacy rows, round-trip of
+new fields, wire-shape omits defaults.
+
 ## Unreleased — Phase 1 multi-modal: inbound images via `view_media`
 
 Agents can now show images to the model. Tool-centric design: the agent

@@ -870,35 +870,108 @@ def _list_uploads() -> str:
 
 
 def _share_with_client(*, path: str, description: str = "") -> str:
-    from . import broker, runtime, workspace as ws
+    """Make a file in this agent's workspace OR this session's project
+    root available to the client. Resolves `path` as:
+
+    - Relative (e.g. "report.pdf", "sub/x.txt") → resolved under the
+      agent's workspace. Unchanged from prior behavior.
+    - Absolute (e.g. "/root/.ark/agents/scribe/workspace/report.pdf" or
+      "/var/projects/foo/report.pdf") → resolved against both the agent's
+      workspace and the current session's project root (if any). The
+      first that contains the file wins; otherwise ToolError.
+
+    This lets agents share project-root files without an intermediate
+    copy into workspace. Clients receive the file_available event with
+    a `root` discriminator ("workspace" | "project") plus `project_id`
+    when applicable, so they know which download endpoint to hit.
+    """
+    from . import broker, projects as _projects, runtime, workspace as ws
     from .types import SharedFile
 
     ctx = current_context()
-    try:
-        full = ws.resolve(ctx.agent.workspace, path)
-    except ws.WorkspaceError as e:
-        raise ToolError(str(e))
+    candidate = Path(path).expanduser()
+    workspace_real = Path(ctx.agent.workspace).resolve()
+
+    # Resolve under either workspace or project root. The agent's cwd is
+    # always the workspace, so a bare relative path keeps today's
+    # "share this workspace file" semantics; absolute paths get a
+    # dual-root check that lets project-rooted shares land cleanly.
+    full: Path | None = None
+    root_kind = "workspace"
+    project_id: str | None = None
+
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+        # Workspace first.
+        try:
+            resolved.relative_to(workspace_real)
+            full = resolved
+            root_kind = "workspace"
+        except ValueError:
+            # Not under workspace — try the session's project root.
+            project = runtime.session_project(ctx.conn, ctx.session_id)
+            if project is None:
+                raise ToolError(
+                    f"path is outside the agent's workspace and this session "
+                    f"has no project binding: {path!r}"
+                )
+            project_root_real = Path(project.root).resolve()
+            try:
+                resolved.relative_to(project_root_real)
+                full = resolved
+                root_kind = "project"
+                project_id = project.id
+            except ValueError:
+                raise ToolError(
+                    f"path is outside both this agent's workspace "
+                    f"({workspace_real}) and the current session's project "
+                    f"root ({project_root_real}): {path!r}"
+                )
+    else:
+        # Relative paths resolve under workspace (status quo). Agents that
+        # want to share project files use absolute paths — matching how
+        # they already operate on project files per docs/projects.md.
+        try:
+            full = ws.resolve(ctx.agent.workspace, path)
+        except ws.WorkspaceError as e:
+            raise ToolError(str(e))
+
+    assert full is not None  # one of the branches set it or raised
     if not full.is_file():
         raise ToolError(f"not a file: {path}")
 
-    rel = ws.relative_to_workspace(ctx.agent.workspace, full)
+    # Compute the root-relative path for the SharedFile row + wire frame.
+    if root_kind == "workspace":
+        rel = ws.relative_to_workspace(ctx.agent.workspace, full)
+    else:
+        # root_kind == "project"
+        project = runtime.session_project(ctx.conn, ctx.session_id)
+        assert project is not None  # verified above when selecting this branch
+        rel = _projects.relative_to_root(project, full)
+
     size = full.stat().st_size
     row_id = runtime.append_message(
-        ctx.conn, ctx.session_id, SharedFile(path=rel, description=description, size=size)
+        ctx.conn, ctx.session_id,
+        SharedFile(
+            path=rel, description=description, size=size,
+            root=root_kind, project_id=project_id,
+        ),
     )
-    broker.publish(
-        ctx.session_id,
-        {
-            "type": "file_available",
-            "session_id": ctx.session_id,
-            "agent_name": ctx.agent.name,
-            "path": rel,
-            "description": description,
-            "size": size,
-            "event_id": row_id,
-        },
-    )
-    return f"shared {rel} with the client ({size} bytes)"
+    payload: dict[str, Any] = {
+        "type": "file_available",
+        "session_id": ctx.session_id,
+        "agent_name": ctx.agent.name,
+        "path": rel,
+        "description": description,
+        "size": size,
+        "event_id": row_id,
+        "root": root_kind,
+    }
+    if project_id is not None:
+        payload["project_id"] = project_id
+    broker.publish(ctx.session_id, payload)
+    where = f"workspace:{rel}" if root_kind == "workspace" else f"project:{rel}"
+    return f"shared {where} with the client ({size} bytes)"
 
 
 _register(
@@ -913,7 +986,17 @@ _register(
 _register(
     ToolSchema(
         name="share_with_client",
-        description="Make a file in this agent's workspace available to the user. The file appears in their UI as a downloadable artifact. `path` is workspace-relative; `description` is an optional short note shown alongside.",
+        description=(
+            "Make a file available to the user as a downloadable artifact. "
+            "`path` can be either (a) workspace-relative — "
+            "e.g. `report.pdf` or `sub/draft.md` — or (b) an absolute "
+            "path, which may point into this agent's workspace OR into the "
+            "current session's bound project root. The file is NOT copied; "
+            "it stays where it is and the client fetches it directly. "
+            "`description` is an optional short note shown alongside. "
+            "Attempts to share paths outside both locations fail with "
+            "ToolError."
+        ),
         input_schema={
             "type": "object",
             "properties": {

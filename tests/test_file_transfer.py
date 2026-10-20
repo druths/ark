@@ -261,6 +261,174 @@ def test_tool_share_with_client_rejects_missing(ark_home, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Dual-root share: workspace + project root both acceptable
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_share_absolute_path_under_workspace(ark_home, tmp_path):
+    """An absolute path pointing INTO the agent's workspace resolves as
+    `root: "workspace"` — the share goes through the same download endpoint
+    as today's relative-path form."""
+    from ark import projects as _projects
+
+    conn = db.init_db()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    sid = runtime.create_session(conn, "scribe", "conversational")
+    ctx = make_ctx(conn, workspace, session_id=sid)
+
+    chart = workspace / "chart.png"
+    chart.write_bytes(b"\x89PNG fake")
+
+    output, err = await tools.execute(
+        "share_with_client",
+        {"path": str(chart.resolve()), "description": "Q4"},
+        ctx=ctx,
+    )
+    assert err is False, output
+    history = runtime.load_history(conn, sid)
+    sf = [m for m in history if isinstance(m, SharedFile)][0]
+    assert sf.root == "workspace"
+    assert sf.project_id is None
+    assert sf.path == "chart.png"
+
+
+@pytest.mark.asyncio
+async def test_share_absolute_path_in_project_root(ark_home, tmp_path):
+    """An absolute path under the session's bound project root is accepted
+    without needing to copy into workspace first. Row carries
+    `root: "project"` + project_id so clients fetch via the project files
+    endpoint rather than the agent files endpoint."""
+    from ark import projects as _projects
+
+    conn = db.init_db()
+    workspace = tmp_path / "ws"; workspace.mkdir()
+    project_root = tmp_path / "proj"; project_root.mkdir()
+    p = _projects.create(
+        conn, name="demo", root=str(project_root),
+        description="", project_context="",
+    )
+    sid = runtime.create_session(conn, "scribe", "conversational", project_id=p.id)
+    ctx = make_ctx(conn, workspace, session_id=sid)
+
+    report = project_root / "Q3-report.pdf"
+    report.write_bytes(b"%PDF-1.4\n...")
+
+    queue = broker.subscribe(sid)
+    try:
+        output, err = await tools.execute(
+            "share_with_client",
+            {"path": str(report.resolve()), "description": "quarterly"},
+            ctx=ctx,
+        )
+        assert err is False, output
+        # Row records the project binding.
+        history = runtime.load_history(conn, sid)
+        sf = [m for m in history if isinstance(m, SharedFile)][0]
+        assert sf.root == "project"
+        assert sf.project_id == p.id
+        assert sf.path == "Q3-report.pdf"
+        assert sf.size == len(b"%PDF-1.4\n...")
+
+        # Broker frame carries root + project_id so the client knows which
+        # endpoint to fetch from.
+        evt = await asyncio.wait_for(queue.get(), timeout=0.5)
+        assert evt["type"] == "file_available"
+        assert evt["root"] == "project"
+        assert evt["project_id"] == p.id
+        assert evt["path"] == "Q3-report.pdf"
+    finally:
+        broker.unsubscribe(sid, queue)
+
+
+@pytest.mark.asyncio
+async def test_share_absolute_path_outside_both_rejects(ark_home, tmp_path):
+    """An absolute path that lands under neither the workspace nor the
+    session's project root is rejected — the trust boundary stays scoped
+    to places the agent legitimately operates in."""
+    from ark import projects as _projects
+
+    conn = db.init_db()
+    workspace = tmp_path / "ws"; workspace.mkdir()
+    project_root = tmp_path / "proj"; project_root.mkdir()
+    p = _projects.create(
+        conn, name="demo", root=str(project_root),
+        description="", project_context="",
+    )
+    sid = runtime.create_session(conn, "scribe", "conversational", project_id=p.id)
+    ctx = make_ctx(conn, workspace, session_id=sid)
+
+    stray = tmp_path / "stray.txt"
+    stray.write_text("not in either root")
+
+    output, err = await tools.execute(
+        "share_with_client", {"path": str(stray.resolve())}, ctx=ctx
+    )
+    assert err is True
+    assert "outside" in output.lower()
+
+
+@pytest.mark.asyncio
+async def test_share_absolute_path_no_project_rejects_clearly(ark_home, tmp_path):
+    """When the session isn't project-bound, an absolute path outside
+    workspace fails with a message naming the specific limitation."""
+    conn = db.init_db()
+    workspace = tmp_path / "ws"; workspace.mkdir()
+    sid = runtime.create_session(conn, "scribe", "conversational")
+    ctx = make_ctx(conn, workspace, session_id=sid)
+
+    stray = tmp_path / "stray.txt"
+    stray.write_text("x")
+
+    output, err = await tools.execute(
+        "share_with_client", {"path": str(stray.resolve())}, ctx=ctx
+    )
+    assert err is True
+    assert "no project binding" in output.lower()
+
+
+def test_shared_file_round_trip_defaults_backwards_compat():
+    """Legacy rows (no root/project_id) load as root='workspace' / None."""
+    from ark.types import message_from_row
+
+    restored = message_from_row(
+        "shared_file",
+        {"path": "chart.png", "description": "", "size": 42},
+    )
+    assert isinstance(restored, SharedFile)
+    assert restored.root == "workspace"
+    assert restored.project_id is None
+
+
+def test_shared_file_round_trip_includes_project_fields_when_set():
+    """New rows carry root + project_id in the serialized form."""
+    from ark.types import message_from_row, message_to_row
+
+    sf = SharedFile(
+        path="Q3.pdf", description="", size=42,
+        root="project", project_id="proj-uuid",
+    )
+    role, content = message_to_row(sf)
+    assert content["root"] == "project"
+    assert content["project_id"] == "proj-uuid"
+    restored = message_from_row(role, content)
+    assert restored.root == "project"
+    assert restored.project_id == "proj-uuid"
+
+
+def test_shared_file_wire_omits_defaults():
+    """Workspace rows don't carry the extra fields — keeps content_json
+    tiny for the common case (and leaves legacy on-disk rows untouched)."""
+    from ark.types import message_to_row
+
+    sf = SharedFile(path="chart.png", description="", size=42)
+    _, content = message_to_row(sf)
+    assert "root" not in content
+    assert "project_id" not in content
+
+
+# ---------------------------------------------------------------------------
 # Provider folding for the new message types
 # ---------------------------------------------------------------------------
 

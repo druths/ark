@@ -68,11 +68,22 @@ class SharedFile:
     """A file the agent has shared with the client via `share_with_client`.
 
     Stored as assistant-side context in conversation history. The bytes live
-    on disk at <workspace>/<path>; clients fetch via the download endpoint."""
+    on disk; clients fetch via the download endpoint matching `root`:
 
-    path: str  # workspace-relative
+    - root == "workspace": `GET /agents/{name}/files/{path}` (path is
+      workspace-relative)
+    - root == "project":   `GET /projects/{project_id}/files/{path}`
+      (path is project-root-relative; `project_id` is the session's bound
+      project at share time)
+
+    Backwards-compat: rows written before this field existed have
+    `root == "workspace"` and `project_id is None`."""
+
+    path: str  # relative to `root`
     description: str = ""
     size: int = 0
+    root: str = "workspace"             # "workspace" | "project"
+    project_id: str | None = None       # populated only when root == "project"
 
 
 @dataclass
@@ -413,11 +424,18 @@ def message_to_row(msg: Message) -> tuple[str, dict[str, Any]]:
             "size": msg.size,
         }
     if isinstance(msg, SharedFile):
-        return "shared_file", {
+        body: dict[str, Any] = {
             "path": msg.path,
             "description": msg.description,
             "size": msg.size,
         }
+        # Keep the on-disk row small for the common (workspace) case:
+        # include the new fields only when they differ from the defaults.
+        if msg.root != "workspace":
+            body["root"] = msg.root
+        if msg.project_id is not None:
+            body["project_id"] = msg.project_id
+        return "shared_file", body
     if isinstance(msg, SessionContext):
         return "session_context", {"text": msg.text}
     if isinstance(msg, TurnMetrics):
@@ -483,6 +501,8 @@ def message_from_row(role: str, content: dict[str, Any]) -> Message:
             path=content["path"],
             description=content.get("description", ""),
             size=content.get("size", 0),
+            root=content.get("root", "workspace"),
+            project_id=content.get("project_id"),
         )
     if role == "session_context":
         return SessionContext(text=content["text"])

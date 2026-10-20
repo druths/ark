@@ -109,12 +109,28 @@ publishes a WebSocket event to every client connected to that session:
   "type": "file_available",
   "path": "chart.png",
   "description": "Q4 summary",
-  "size": 84211
+  "size": 84211,
+  "root": "workspace"
 }
 ```
 
-`path` is workspace-relative — fetch via the download endpoint above. The
-event is emitted *after* the corresponding `SharedFile` message has been
+`path` is relative to `root`. For `root: "workspace"` (the default),
+fetch via `GET /agents/{name}/files/<path>` as above. For
+`root: "project"` the frame also carries `project_id`, and clients
+fetch via `GET /projects/{project_id}/files/<path>`:
+
+```json
+{
+  "type": "file_available",
+  "path": "Q3-report.pdf",
+  "description": "quarterly",
+  "size": 262144,
+  "root": "project",
+  "project_id": "abc-123"
+}
+```
+
+The event is emitted *after* the corresponding `SharedFile` message has been
 persisted to history, so clients that connect later still see it via
 `GET /history`.
 
@@ -125,7 +141,7 @@ The agent has two built-in tools for file transfer:
 | Tool | Purpose |
 |---|---|
 | `list_uploads()` | List files in the agent's `uploads/` directory, newest first. Convenience around `list_files("uploads")` that the agent gets up-front in the manifest. |
-| `share_with_client(path, description="")` | Make a workspace file downloadable by the client. Persists a `SharedFile` message and publishes `file_available`. Validates the path is inside the workspace (`..`/absolute paths/symlinks rejected). |
+| `share_with_client(path, description="")` | Make a file downloadable by the client. Accepts (a) a workspace-relative path, or (b) an absolute path pointing into either the agent's workspace OR the current session's bound project root. The file is not copied — it stays where it is and the client fetches it directly. Persists a `SharedFile` message (with `root: "workspace"` or `root: "project"`) and publishes `file_available` with the matching `root`/`project_id`. Paths outside both locations are rejected. |
 
 The system prompt automatically tells the agent about these tools and where
 attachments live ([ark/runtime.py:system_prompt](../ark/runtime.py)). Agents
@@ -161,7 +177,15 @@ Two new message kinds appear in `GET /agents/{name}/sessions/{sid}/history`:
 
 { "kind": "SharedFile",
   "data": { "path": "chart.png", "description": "Q4 summary", "size": 84211 } }
+
+{ "kind": "SharedFile",
+  "data": { "path": "Q3-report.pdf", "description": "quarterly",
+            "size": 262144, "root": "project", "project_id": "abc-123" } }
 ```
+
+`root` and `project_id` are omitted from the on-disk row for the
+workspace-default case (keeping legacy rows tiny); loaders fill the
+defaults (`root: "workspace"`, `project_id: null`) automatically.
 
 When constructing the next LLM prompt, both providers fold these into text
 markers in the natural place (user-side text for uploads, assistant-side
