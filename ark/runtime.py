@@ -1067,6 +1067,8 @@ async def run_user_turn(
                             input_tokens=evt.input_tokens,
                             output_tokens=evt.output_tokens,
                             model=evt.model or agent.model,
+                            ttft_ms=evt.ttft_ms,
+                            duration_ms=evt.duration_ms,
                         ),
                     )
                     tokens_used += evt.input_tokens + evt.output_tokens
@@ -1079,6 +1081,8 @@ async def run_user_turn(
                         model=evt.model or agent.model,
                         context_window=context_window,
                         row_id=metrics_id,
+                        ttft_ms=evt.ttft_ms,
+                        duration_ms=evt.duration_ms,
                     )
                 elif isinstance(evt, AssistantTurnEnd):
                     last_stop_reason = evt.stop_reason
@@ -1287,6 +1291,10 @@ def event_to_wire(evt: RuntimeEvent | Message) -> dict:
         }
         if evt.row_id is not None:
             out["event_id"] = evt.row_id
+        if evt.ttft_ms is not None:
+            out["ttft_ms"] = evt.ttft_ms
+        if evt.duration_ms is not None:
+            out["duration_ms"] = evt.duration_ms
         return out
     if isinstance(evt, RunErrorEvent):
         out = {"type": "error", "code": evt.code, "message": evt.message}

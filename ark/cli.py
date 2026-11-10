@@ -159,6 +159,11 @@ def cmd_sessions(args: argparse.Namespace) -> int:
 _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 
+def _fmt_ms(ms: float) -> str:
+    # Sub-second: "420ms". Seconds: "3.2s". Keeps the usage line compact.
+    return f"{ms/1000:.1f}s" if ms >= 1000 else f"{int(round(ms))}ms"
+
+
 class _Ui:
     """Renders streaming assistant text plus a transient animated status line.
 
@@ -218,6 +223,8 @@ class _Ui:
         output_tokens: int,
         context_window: int | None,
         model: str,
+        ttft_ms: float | None = None,
+        duration_ms: float | None = None,
     ) -> None:
         """Dim per-turn token-usage indicator."""
         self._wipe_status()
@@ -232,6 +239,13 @@ class _Ui:
             )
         else:
             msg = f"in {input_tokens:,} · out {output_tokens:,}"
+        if ttft_ms is not None or duration_ms is not None:
+            parts: list[str] = []
+            if ttft_ms is not None:
+                parts.append(f"ttft {_fmt_ms(ttft_ms)}")
+            if duration_ms is not None:
+                parts.append(f"total {_fmt_ms(duration_ms)}")
+            msg += f" · {' / '.join(parts)}"
         if model:
             msg += f" · {model}"
         sys.stderr.write(f"\033[2m[{msg}]\033[0m\n")
@@ -285,11 +299,15 @@ def _handle_event(ui: _Ui, evt: dict) -> None:
             ui.error_line(f"[tool error: {preview}]" if preview else "[tool error]")
         ui.status("thinking")
     elif t == "turn_usage":
+        ttft = evt.get("ttft_ms")
+        dur = evt.get("duration_ms")
         ui.usage(
             int(evt.get("input_tokens", 0)),
             int(evt.get("output_tokens", 0)),
             evt.get("context_window"),
             evt.get("model") or "",
+            ttft_ms=float(ttft) if ttft is not None else None,
+            duration_ms=float(dur) if dur is not None else None,
         )
     elif t == "error":
         code = evt.get("code") or "other"
@@ -911,7 +929,12 @@ def _format_session(meta: dict, history: list[dict]) -> None:
             desc = f" — {d['description']}" if d.get("description") else ""
             print(f"  → shared: {d.get('path')} ({d.get('size')} bytes){desc}")
         elif k == "TurnMetrics":
-            print(f"     [metrics: in={d.get('input_tokens')} out={d.get('output_tokens')}]")
+            line = f"     [metrics: in={d.get('input_tokens')} out={d.get('output_tokens')}"
+            if d.get("ttft_ms") is not None:
+                line += f" · ttft {_fmt_ms(float(d['ttft_ms']))}"
+            if d.get("duration_ms") is not None:
+                line += f" · total {_fmt_ms(float(d['duration_ms']))}"
+            print(line + "]")
         elif k == "RunError":
             print(f"  ✗ error: {d.get('code')} — {_truncate(d.get('message', ''), 200)}")
         elif k == "SessionContext":

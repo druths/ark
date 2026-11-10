@@ -1,5 +1,56 @@
 # Changelog
 
+## Unreleased — Per-call latency metrics: `ttft_ms`, `duration_ms`
+
+Each provider adapter now stamps two wall-clock timings on its
+TurnUsageEvent:
+
+- **`ttft_ms`** — time-to-first-token: ms from request send to the first
+  streamed output event (TextDelta, ThinkingDelta, or ToolCallEvent).
+  None if the stream ended with no output.
+- **`duration_ms`** — ms from request send to the usage chunk (the whole
+  stream, minus the AssistantTurnEnd that arrives moments later).
+
+The runtime copies both fields onto the persisted `TurnMetrics` row and
+re-emits them on the forwarded `turn_usage` WS event. A tool-using turn
+that runs the model→tools loop N times produces N data points — one per
+iteration — so you can see per-call latency, not just a turn aggregate.
+
+### Surfaces
+
+- `turn_usage` WS frame: optional `ttft_ms` and `duration_ms` fields
+  (present only when the adapter captured them — absent frames are
+  byte-identical to today's shape).
+- `ark chat`'s dim per-turn indicator: `[... · ttft 250ms / total 1.2s · model]`.
+- `ark show <session>` history: `[metrics: in=… out=… · ttft 250ms · total 1.2s]`.
+
+### Why
+
+The `speed` hint added last change lets a client ask for a latency-sorted
+provider on OpenRouter, but without a metric there was no way to tell
+whether the hint did anything. These numbers close that loop; they also
+make slow-turn debugging tractable on any backend.
+
+### Backwards-compat
+
+Both fields are optional (`float | None`). Persisted rows written before
+this change have no `ttft_ms` / `duration_ms` key in their JSON blob;
+`message_from_row` reads them with `.get()` + None default. New rows
+still omit the keys when the timings aren't set, keeping the on-disk
+shape byte-identical to the legacy form in that case.
+
+### Tests
+
+`tests/test_turn_metrics_timings.py` (new, 12 cases):
+TurnMetrics round-trip with and without timings, legacy row loading,
+`_with_timings` helper (populated, TTFT-missing), OpenAI adapter
+end-to-end with a faked monotonic clock, OpenRouter inheriting the
+instrumentation, runtime pipes adapter timings through to both the
+persisted row and the outbound event, wire frame carries the fields
+when present and omits them when absent, and the CLI `usage` indicator
+renders them (`ttft 250ms / total 1.2s`) or skips cleanly when the
+adapter didn't stamp them.
+
 ## Unreleased — Per-turn `speed` hint, OpenRouter latency-sort baked in
 
 Clients can now suggest a response "speed" per turn via a new optional
@@ -10,10 +61,16 @@ Clients can now suggest a response "speed" per turn via a new optional
 ```
 
 Strictly a hint, not a contract. For OpenRouter-backed agents the
-built-in `fast` mapping adds `provider: {"sort": "latency"}` to the
-request body, biasing provider selection toward the lowest-latency
-endpoint for the same model. For Anthropic/OpenAI/Gemini direct, the
-hint is a silent no-op — "fast" never means "switch models."
+built-in `fast` mapping adds
+`provider: {"preferred_max_latency": {"p50": 1.0}}` to the request
+body — a **soft** threshold OpenRouter uses to pre-filter the provider
+pool, letting its default router (which already weighs TTFT) pick from
+the fast-enough subset. Fallbacks still work if nothing qualifies.
+Earlier revisions of this change used `provider.sort: "latency"`
+instead; swapped out after A/B testing showed it regressed real TTFT
+by 30–60% because it opts out of the smart default router. For
+Anthropic/OpenAI/Gemini direct, the hint is a silent no-op — "fast"
+never means "switch models."
 
 ### Config: per-agent `speed_hints`
 
@@ -24,12 +81,16 @@ Agents can override, extend, or disable hints:
   "scribe": {
     ...
     "speed_hints": {
-      "fast":  { "provider_sort": "throughput" },
+      "fast":  { "preferred_max_latency_p50": 0.5 },
       "cheap": null
     }
   }
 }
 ```
+
+Supported keys on OpenRouter: `preferred_max_latency_p50` (float
+seconds) and `provider_sort` (`"latency" | "throughput" | "price"`);
+may be combined. Unknown keys are ignored.
 
 - Missing key → provider-type baseline (OpenRouter's `fast`).
 - Object value → overrides baseline for that hint.

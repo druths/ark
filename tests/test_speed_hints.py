@@ -34,11 +34,13 @@ from ark.runtime import effective_speed_hints, resolve_speed_options
 # ---------------------------------------------------------------------------
 
 
-def test_openrouter_has_fast_latency_baseline():
-    """OpenRouter ships with `fast -> provider_sort: latency` so new users
-    get the hint for free without editing config."""
+def test_openrouter_has_fast_preferred_latency_baseline():
+    """OpenRouter ships with `fast -> preferred_max_latency_p50: 1.0` so
+    new users get the hint for free. We deliberately use a soft threshold
+    (biases the default router) rather than `sort: "latency"` (which opts
+    out of the smart router and empirically regresses TTFT)."""
     assert OpenRouterProvider.DEFAULT_SPEED_HINTS == {
-        "fast": {"provider_sort": "latency"}
+        "fast": {"preferred_max_latency_p50": 1.0}
     }
 
 
@@ -65,7 +67,7 @@ def test_effective_missing_uses_baseline():
     """Agent doesn't mention `fast` → OpenRouter's baseline applies."""
     a = _agent()
     assert effective_speed_hints(a, "openrouter") == {
-        "fast": {"provider_sort": "latency"}
+        "fast": {"preferred_max_latency_p50": 1.0}
     }
 
 
@@ -104,10 +106,10 @@ def test_resolve_no_hint_returns_none():
     assert resolve_speed_options(a, "openrouter", None) is None
 
 
-def test_resolve_fast_on_openrouter_returns_latency():
+def test_resolve_fast_on_openrouter_returns_preferred_latency():
     a = _agent()
     assert resolve_speed_options(a, "openrouter", "fast") == {
-        "provider_sort": "latency"
+        "preferred_max_latency_p50": 1.0
     }
 
 
@@ -135,6 +137,15 @@ def test_resolve_unknown_hint_returns_none():
 # ---------------------------------------------------------------------------
 
 
+def test_openrouter_build_extra_body_preferred_latency_p50():
+    """The default-baseline shape: a soft p50 threshold the router uses to
+    pre-filter the provider pool, then pick with the smart default router."""
+    p = OpenRouterProvider(api_key="or-test")
+    assert p._build_extra_body({"preferred_max_latency_p50": 1.0}) == {
+        "provider": {"preferred_max_latency": {"p50": 1.0}}
+    }
+
+
 def test_openrouter_build_extra_body_latency():
     p = OpenRouterProvider(api_key="or-test")
     assert p._build_extra_body({"provider_sort": "latency"}) == {
@@ -151,11 +162,30 @@ def test_openrouter_build_extra_body_throughput():
     }
 
 
-def test_openrouter_build_extra_body_rejects_unknown_sort():
-    """Defensive: an unknown `provider_sort` is dropped rather than
-    forwarded — we won't 400 the OpenRouter call on a config typo."""
+def test_openrouter_build_extra_body_combines_sort_and_threshold():
+    """An agent with an override can pair both knobs; the adapter emits
+    them in a single `provider` block."""
+    p = OpenRouterProvider(api_key="or-test")
+    out = p._build_extra_body({
+        "provider_sort": "throughput",
+        "preferred_max_latency_p50": 0.5,
+    })
+    assert out == {
+        "provider": {
+            "sort": "throughput",
+            "preferred_max_latency": {"p50": 0.5},
+        }
+    }
+
+
+def test_openrouter_build_extra_body_rejects_bad_values():
+    """Defensive: unknown `provider_sort` or non-positive p50 are dropped
+    rather than forwarded — a config typo won't 400 the OpenRouter call."""
     p = OpenRouterProvider(api_key="or-test")
     assert p._build_extra_body({"provider_sort": "banana"}) == {}
+    assert p._build_extra_body({"preferred_max_latency_p50": 0}) == {}
+    assert p._build_extra_body({"preferred_max_latency_p50": "fast"}) == {}
+    assert p._build_extra_body({"preferred_max_latency_p50": -1}) == {}
 
 
 def test_openrouter_build_extra_body_empty_or_none():
@@ -219,11 +249,12 @@ def test_config_loader_rejects_scalar_hint_value():
 
 
 @pytest.mark.asyncio
-async def test_openrouter_sends_provider_sort_in_request(monkeypatch):
-    """The whole point: when a turn carries `speed_options={provider_sort: latency}`,
-    the OpenAI SDK client receives `extra_body={"provider": {"sort": "latency"}}`,
-    which OpenRouter reads to bias provider selection."""
-    from ark.types import AssistantTurnEnd, TurnUsageEvent, UserText
+async def test_openrouter_sends_preferred_max_latency_in_request():
+    """The whole point of the baseline hint: when a turn carries the
+    default `fast` options, the OpenAI SDK client receives
+    `extra_body={"provider": {"preferred_max_latency": {"p50": 1.0}}}`,
+    which OpenRouter reads to pre-filter the provider pool."""
+    from ark.types import UserText
 
     captured: dict = {}
 
@@ -245,17 +276,18 @@ async def test_openrouter_sends_provider_sort_in_request(monkeypatch):
     p = OpenRouterProvider(api_key="or-test")
     p._client.chat = FakeChat()
 
-    events = []
-    async for evt in p.stream_turn(
+    async for _ in p.stream_turn(
         model="anthropic/claude-sonnet-4.5",
         system="",
         messages=[UserText(text="hi")],
         tools=[],
-        speed_options={"provider_sort": "latency"},
+        speed_options={"preferred_max_latency_p50": 1.0},
     ):
-        events.append(evt)
+        pass
 
-    assert captured["extra_body"] == {"provider": {"sort": "latency"}}
+    assert captured["extra_body"] == {
+        "provider": {"preferred_max_latency": {"p50": 1.0}}
+    }
     # Everything else about the request is normal.
     assert captured["model"] == "anthropic/claude-sonnet-4.5"
     assert captured["stream"] is True

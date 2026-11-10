@@ -657,9 +657,13 @@ field on the `user_message` WS frame:
 The hint is strictly a **hint, not a contract**. It names a knob
 ("fast"); whether anything happens depends on the agent's provider:
 
-- **OpenRouter** — built-in `fast → provider.sort: "latency"`. The same
-  model is requested, and OpenRouter biases provider selection toward
-  the lowest-latency endpoint. See
+- **OpenRouter** — built-in `fast → preferred_max_latency: {p50: 1.0}`. A
+  **soft** threshold: OpenRouter pre-filters the provider pool to those
+  whose rolling p50 TTFT sits under 1s, then its default router (which
+  itself already weighs TTFT) picks from what's left. Fallbacks still
+  work if nothing qualifies. We deliberately don't set `sort: "latency"`
+  here — that opts out of the smart default router and in practice
+  regresses TTFT by picking providers with worse p90/p99 behavior. See
   [OpenRouter: provider routing](https://openrouter.ai/docs/features/provider-routing).
 - **Anthropic / OpenAI / Gemini direct** — no built-in. The hint is a
   silent no-op. "Fast" never means "switch to a smaller/cheaper model"
@@ -689,8 +693,10 @@ Resolution:
 
 - **Missing key** → provider-type's built-in default (if any).
 - **Object value** → overrides the baseline for this hint (keys depend
-  on provider — OpenRouter understands `provider_sort`:
-  `"latency" | "throughput" | "price"`).
+  on provider — OpenRouter understands `provider_sort`
+  (`"latency" | "throughput" | "price"`) and
+  `preferred_max_latency_p50` (float seconds); both translate to
+  OpenRouter's `provider` extension and may be combined).
 - **`null`** → explicitly disables the baseline. Different from "missing"
   — missing keeps the default, `null` makes the hint a no-op on this agent.
 
@@ -717,9 +723,11 @@ I didn't ask about" from happening.
 
 The hint itself is not persisted in history. The provider adapter
 applies its chosen options at request time, and `TurnMetrics` records
-the actual model string used. For OpenRouter specifically, the
-`sort: "latency"` nudge leaves no trace in the response body beyond the
-turn being faster.
+the actual model string used plus two wall-clock timings — `ttft_ms`
+(time-to-first-token) and `duration_ms` (total stream duration) — so
+you can tell whether a `fast` turn actually came back faster than a
+default one on the same model. Both are also surfaced live on the
+`turn_usage` WS event per model→tools loop iteration.
 
 ## Multi-modal input
 

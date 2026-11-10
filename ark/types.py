@@ -120,15 +120,25 @@ class SessionContext:
 
 @dataclass
 class TurnMetrics:
-    """Per-turn telemetry: token counts reported by the provider.
+    """Per-turn telemetry: token counts + wall-clock timings reported by the
+    provider adapter.
 
-    Persisted in session history so total session cost / context fill can be
-    computed later. NOT sent to the LLM as a conversation turn — the runtime
-    filters these out before passing the message list to the provider."""
+    Persisted in session history so total session cost / context fill /
+    latency can be computed later. NOT sent to the LLM as a conversation
+    turn — the runtime filters these out before passing the message list to
+    the provider.
+
+    `ttft_ms` is time-to-first-token: ms from request send to the first
+    streamed output event (TextDelta, ThinkingDelta, or ToolCallEvent).
+    `duration_ms` is the full stream duration: request send → TurnUsageEvent
+    emission. Both None on rows written before this field existed (loaders
+    fill the default)."""
 
     input_tokens: int
     output_tokens: int
     model: str = ""
+    ttft_ms: float | None = None
+    duration_ms: float | None = None
 
 
 @dataclass
@@ -290,16 +300,23 @@ class RunEnd:
 
 @dataclass
 class TurnUsageEvent:
-    """Token counts reported by the provider for the just-completed turn.
+    """Token counts + wall-clock timings reported by the provider for the
+    just-completed turn.
 
     Yielded by provider adapters just before AssistantTurnEnd. The runtime
-    persists this as a TurnMetrics message and forwards it to the client."""
+    persists this as a TurnMetrics message and forwards it to the client.
+
+    `ttft_ms` and `duration_ms` are captured by the adapter itself (it is
+    the only place that sees both ends of the stream accurately); None on
+    adapters that don't instrument yet or on a stream with no output."""
 
     input_tokens: int
     output_tokens: int
     model: str = ""
     context_window: int | None = None  # provider's known max, if any
     row_id: int | None = None           # messages.id of TurnMetrics row
+    ttft_ms: float | None = None        # request → first output event
+    duration_ms: float | None = None    # request → final usage chunk
 
 
 @dataclass
@@ -439,11 +456,16 @@ def message_to_row(msg: Message) -> tuple[str, dict[str, Any]]:
     if isinstance(msg, SessionContext):
         return "session_context", {"text": msg.text}
     if isinstance(msg, TurnMetrics):
-        return "turn_metrics", {
+        body: dict[str, Any] = {
             "input_tokens": msg.input_tokens,
             "output_tokens": msg.output_tokens,
             "model": msg.model,
         }
+        if msg.ttft_ms is not None:
+            body["ttft_ms"] = msg.ttft_ms
+        if msg.duration_ms is not None:
+            body["duration_ms"] = msg.duration_ms
+        return "turn_metrics", body
     if isinstance(msg, RunError):
         return "run_error", {"code": msg.code, "message": msg.message}
     if isinstance(msg, CompactionSummary):
@@ -507,10 +529,14 @@ def message_from_row(role: str, content: dict[str, Any]) -> Message:
     if role == "session_context":
         return SessionContext(text=content["text"])
     if role == "turn_metrics":
+        ttft = content.get("ttft_ms")
+        dur = content.get("duration_ms")
         return TurnMetrics(
             input_tokens=int(content.get("input_tokens", 0)),
             output_tokens=int(content.get("output_tokens", 0)),
             model=content.get("model", ""),
+            ttft_ms=float(ttft) if ttft is not None else None,
+            duration_ms=float(dur) if dur is not None else None,
         )
     if role == "run_error":
         return RunError(code=content.get("code", "other"), message=content.get("message", ""))

@@ -8,6 +8,8 @@ normalized `ProviderEvent` union.
 from __future__ import annotations
 
 import json
+import time
+from dataclasses import replace
 from typing import Any, AsyncIterator, Iterable, Protocol
 
 import anthropic
@@ -128,6 +130,25 @@ def _shared_marker(msg: SharedFile) -> str:
     return f"[shared with user: '{msg.path}' ({msg.size} bytes){desc}]"
 
 
+def _with_timings(
+    evt: "TurnUsageEvent", t0: float, t_first: float | None
+) -> "TurnUsageEvent":
+    """Attach adapter-measured wall-clock timings to a TurnUsageEvent.
+
+    `t0` is the monotonic clock just before the request went out; `t_first`
+    is the monotonic clock when the first streamed output event arrived
+    (None if the stream ended with no output — rare, but e.g. a model that
+    refuses or an immediate stop). Called at TurnUsageEvent emission time,
+    so `duration_ms` is request → usage-chunk, not request → stream close
+    (the difference is negligible — usage is the penultimate event)."""
+    now = time.monotonic()
+    return replace(
+        evt,
+        ttft_ms=(t_first - t0) * 1000.0 if t_first is not None else None,
+        duration_ms=(now - t0) * 1000.0,
+    )
+
+
 class Provider(Protocol):
     # Provider-type baseline for client "speed" hints — see
     # runtime.resolve_speed_options. Each key is a hint name (e.g. "fast");
@@ -185,9 +206,17 @@ class AnthropicProvider:
         if api_tools:
             kwargs["tools"] = api_tools
         state = _State()
+        t0 = time.monotonic()
+        t_first: float | None = None
         async with self._client.messages.stream(**kwargs) as stream:
             async for event in stream:
                 for translated in _translate(event, state, model):
+                    if t_first is None and isinstance(
+                        translated, (TextDelta, ThinkingDelta, ToolCallEvent)
+                    ):
+                        t_first = time.monotonic()
+                    if isinstance(translated, TurnUsageEvent):
+                        translated = _with_timings(translated, t0, t_first)
                     yield translated
 
 
@@ -430,8 +459,16 @@ class OpenAIProvider:
         extra_body = self._build_extra_body(speed_options)
         if extra_body:
             kwargs["extra_body"] = extra_body
+        t0 = time.monotonic()
+        t_first: float | None = None
         stream = await self._client.chat.completions.create(**kwargs)
         async for evt in _translate_openai_stream(stream, model=model):
+            if t_first is None and isinstance(
+                evt, (TextDelta, ThinkingDelta, ToolCallEvent)
+            ):
+                t_first = time.monotonic()
+            if isinstance(evt, TurnUsageEvent):
+                evt = _with_timings(evt, t0, t_first)
             yield evt
 
     def _build_extra_body(
@@ -452,12 +489,18 @@ class OpenRouterProvider(OpenAIProvider):
 
     DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 
-    # OpenRouter's provider-routing `sort` field is a first-class latency knob
-    # (same model, picks the lowest-latency provider). `fast` is the only
-    # baked-in hint; agents can add more via AgentConfig.speed_hints.
+    # Fast on OpenRouter: soft-prefer providers with a rolling p50 TTFT
+    # under 1s, but DON'T override the default router's provider ranking
+    # (which already weighs TTFT). Setting `sort: "latency"` instead would
+    # opt out of that smart router and rank purely by historical p50,
+    # which in practice ends up picking providers with worse p90/p99
+    # behavior (observed +30-60% TTFT regression on real traffic). The
+    # soft threshold biases without downgrading. 1.0s is an educated
+    # default — users can tune via speed_hints. Fallbacks still work if
+    # no provider qualifies.
     # https://openrouter.ai/docs/features/provider-routing
     DEFAULT_SPEED_HINTS: dict[str, dict[str, Any]] = {
-        "fast": {"provider_sort": "latency"},
+        "fast": {"preferred_max_latency_p50": 1.0},
     }
 
     def __init__(self, api_key: str, base_url: str | None = None) -> None:
@@ -466,12 +509,30 @@ class OpenRouterProvider(OpenAIProvider):
     def _build_extra_body(
         self, speed_options: dict[str, Any] | None
     ) -> dict[str, Any]:
+        """Translate structured speed_options into OpenRouter's `provider`
+        extension on the request body. Supported keys:
+
+        - `provider_sort`: "latency" | "throughput" | "price" — opts out of
+          the default router and ranks providers by that metric alone.
+          Rarely the right answer for TTFT (see DEFAULT_SPEED_HINTS note).
+        - `preferred_max_latency_p50`: float seconds — a soft threshold
+          OpenRouter uses to pre-filter the provider pool before the
+          default router picks. Doesn't override the router, just biases it.
+
+        Unknown/invalid values are dropped silently — a config typo won't
+        400 the OpenRouter call."""
         if not speed_options:
             return {}
+        provider: dict[str, Any] = {}
         sort = speed_options.get("provider_sort")
-        if sort not in ("latency", "throughput", "price"):
+        if sort in ("latency", "throughput", "price"):
+            provider["sort"] = sort
+        p50 = speed_options.get("preferred_max_latency_p50")
+        if isinstance(p50, (int, float)) and p50 > 0:
+            provider["preferred_max_latency"] = {"p50": float(p50)}
+        if not provider:
             return {}
-        return {"provider": {"sort": sort}}
+        return {"provider": provider}
 
 
 def to_openai_messages(system: str, messages: list[Message]) -> list[dict[str, Any]]:
@@ -673,10 +734,18 @@ class GoogleProvider:
                 )
             ]
         config = gtypes.GenerateContentConfig(**config_kwargs)
+        t0 = time.monotonic()
+        t_first: float | None = None
         stream = await self._client.aio.models.generate_content_stream(
             model=model, contents=contents, config=config
         )
         async for evt in _translate_google_stream(stream, model=model):
+            if t_first is None and isinstance(
+                evt, (TextDelta, ThinkingDelta, ToolCallEvent)
+            ):
+                t_first = time.monotonic()
+            if isinstance(evt, TurnUsageEvent):
+                evt = _with_timings(evt, t0, t_first)
             yield evt
 
 
