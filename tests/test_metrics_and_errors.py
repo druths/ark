@@ -208,7 +208,7 @@ async def test_turn_usage_is_persisted_and_emitted(ark_home, tmp_path):
     sid = runtime.create_session(conn, "scribe", "conversational")
 
     class _StubProvider:
-        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096):
+        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096, speed_options=None):
             yield TurnUsageEvent(input_tokens=1234, output_tokens=42, model=model)
             yield AssistantTurnEnd(text="ok", stop_reason="end_turn")
 
@@ -248,7 +248,7 @@ async def test_turn_metrics_filtered_from_llm_list(ark_home, tmp_path):
     captured = {}
 
     class _StubProvider:
-        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096):
+        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096, speed_options=None):
             captured["messages"] = list(messages)
             yield AssistantTurnEnd(text="ok", stop_reason="end_turn")
 

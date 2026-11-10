@@ -68,13 +68,60 @@ def _detect_local_timezone() -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def cmd_agents(_args: argparse.Namespace) -> int:
+def cmd_agents(args: argparse.Namespace) -> int:
     base_url, secret = _client_settings()
+    name = getattr(args, "name", None)
+    if name:
+        r = httpx.get(f"{base_url}/agents/{name}", headers=_headers(secret), timeout=10)
+        if r.status_code == 404:
+            print(f"unknown agent: {name}", file=sys.stderr)
+            return 1
+        r.raise_for_status()
+        _print_agent_detail(r.json())
+        return 0
     r = httpx.get(f"{base_url}/agents", headers=_headers(secret), timeout=10)
     r.raise_for_status()
     for a in r.json():
         print(f"{a['name']:20s}  {a['provider']:12s}  {a['model']}")
     return 0
+
+
+def _print_agent_detail(a: dict) -> None:
+    print(f"name:          {a['name']}")
+    print(f"provider:      {a['provider']} ({a['provider_type']})")
+    print(f"model:         {a['model']}")
+    print(f"workspace:     {a['workspace']}")
+    skills = a.get("always_loaded_skills") or []
+    if skills:
+        print(f"always-loaded: {', '.join(skills)}")
+    hb = a.get("heartbeat_seconds")
+    if hb is not None:
+        print(f"heartbeat:     {hb}s")
+    mcp_servers = a.get("mcp_servers") or []
+    if mcp_servers:
+        print("mcp_servers:")
+        for s in mcp_servers:
+            mark = " (always)" if s.get("always_loaded") else ""
+            status = "ok" if s.get("ready") else f"error: {s.get('error')}"
+            print(f"  - {s['name']}{mark}: {status} ({s.get('tool_count', 0)} tools)")
+    crons = a.get("crons") or []
+    if crons:
+        print("crons:")
+        for c in crons:
+            print(f"  - {c['id']}: {c['expr']}")
+    hints = a.get("speed_hints") or {}
+    if hints:
+        print("speed_hints (effective):")
+        for hint, opts in hints.items():
+            if opts is None:
+                print(f"  - {hint}: (disabled)")
+            elif not opts:
+                print(f"  - {hint}: (no-op)")
+            else:
+                parts = ", ".join(f"{k}={v}" for k, v in opts.items())
+                print(f"  - {hint}: {parts}")
+    else:
+        print("speed_hints:   (none — provider has no defaults and agent didn't add any)")
 
 
 # ---------------------------------------------------------------------------
@@ -410,13 +457,20 @@ async def _chat(
                     stop.set()
                     turn_done.set()  # unblock writer so it can exit
 
+            # One-shot speed hint. `/fast <message>` or a prior `/fast` toggle
+            # tags the NEXT user_message with speed="fast", then resets. Kept
+            # non-sticky so "fast" never silently rides along turns the user
+            # didn't ask for.
+            next_speed: dict[str, str | None] = {"value": None}
+
             async def writer():
                 loop = asyncio.get_event_loop()
                 while not stop.is_set():
                     await turn_done.wait()
                     if stop.is_set():
                         return
-                    print("you> ", end="", flush=True, file=sys.stderr)
+                    prompt = "you> " if next_speed["value"] is None else f"you[{next_speed['value']}]> "
+                    print(prompt, end="", flush=True, file=sys.stderr)
                     line = await loop.run_in_executor(None, sys.stdin.readline)
                     if line == "":  # EOF
                         await ws.close()
@@ -424,7 +478,20 @@ async def _chat(
                     text = line.strip()
                     if not text:
                         continue
-                    if text.startswith("/attach "):
+                    if text == "/fast":
+                        # Toggle: re-arm for next send, or disarm if already armed.
+                        next_speed["value"] = "fast" if next_speed["value"] != "fast" else None
+                        state = "armed" if next_speed["value"] else "cleared"
+                        print(f"[/fast: {state} for next send]", file=sys.stderr)
+                        continue
+                    if text.startswith("/fast "):
+                        rest = text[len("/fast "):].strip()
+                        if not rest:
+                            print("[/fast: empty message, ignored]", file=sys.stderr)
+                            continue
+                        next_speed["value"] = "fast"
+                        text = rest  # fall through as a normal send
+                    elif text.startswith("/attach "):
                         path = Path(text[len("/attach "):].strip()).expanduser()
                         try:
                             info = await _upload_one(http, agent, session_id, path)
@@ -499,6 +566,9 @@ async def _chat(
                     local_tz = _detect_local_timezone()
                     if local_tz:
                         frame["timezone"] = local_tz
+                    if next_speed["value"] is not None:
+                        frame["speed"] = next_speed["value"]
+                        next_speed["value"] = None  # one-shot: clear after send
                     await ws.send(json.dumps(frame))
 
             await asyncio.gather(reader(), writer())
@@ -890,7 +960,14 @@ def build_parser() -> argparse.ArgumentParser:
         func=cmd_init
     )
 
-    sub.add_parser("agents", help="list configured agents").set_defaults(func=cmd_agents)
+    agents_cmd = sub.add_parser(
+        "agents",
+        help="list configured agents, or show one with `ark agents <name>`",
+    )
+    agents_cmd.add_argument(
+        "name", nargs="?", help="agent to show in detail (omit to list all)"
+    )
+    agents_cmd.set_defaults(func=cmd_agents)
 
     sess = sub.add_parser("sessions", help="list an agent's sessions")
     sess.add_argument("agent")

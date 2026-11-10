@@ -161,7 +161,7 @@ def test_server_generated_summary_calls_summarizer(ark_home, tmp_path, monkeypat
     runtime.append_message(conn, sid, AssistantText(text="pyramids are ..."))
 
     class _StubProvider:
-        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096):
+        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096, speed_options=None):
             # Verify the summarizer got the right shape.
             assert "producing a summary" in system.lower()
             assert tools == []

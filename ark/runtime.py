@@ -8,7 +8,7 @@ import sqlite3
 import sys
 import time
 import uuid
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from dataclasses import asdict, is_dataclass
 
@@ -76,6 +76,62 @@ def make_provider(provider_type: str, *, api_key: str, base_url: str | None = No
 
         return GoogleProvider(api_key=api_key, base_url=base_url)
     raise ValueError(f"unsupported provider_type: {provider_type}")
+
+
+def provider_class_for(provider_type: str) -> type[Provider]:
+    """Return the Provider class for a provider_type without instantiating.
+    Used to query DEFAULT_SPEED_HINTS for the merged hint map on
+    GET /agents/{name}, where no API call is being made."""
+    from .provider import GoogleProvider, OpenAIProvider, OpenRouterProvider
+
+    if provider_type == "anthropic":
+        return AnthropicProvider
+    if provider_type == "openai":
+        return OpenAIProvider
+    if provider_type == "openrouter":
+        return OpenRouterProvider
+    if provider_type == "google":
+        return GoogleProvider
+    raise ValueError(f"unsupported provider_type: {provider_type}")
+
+
+def effective_speed_hints(
+    agent: AgentConfig, provider_type: str
+) -> dict[str, dict[str, Any] | None]:
+    """Resolve the merged `hint -> options` map for an agent + provider.
+
+    Semantics (per docs/sessions.md):
+    - Missing from agent.speed_hints → use the provider-type's baseline
+      (e.g. OpenRouter's built-in `fast → {provider_sort: "latency"}`).
+    - Agent key with dict value → overrides the baseline for that hint.
+    - Agent key with None value → explicitly disables the baseline (hint
+      is a no-op even though the provider has a default).
+    """
+    baseline = dict(provider_class_for(provider_type).DEFAULT_SPEED_HINTS)
+    merged: dict[str, dict[str, Any] | None] = {k: dict(v) for k, v in baseline.items()}
+    if agent.speed_hints:
+        for hint, override in agent.speed_hints.items():
+            merged[hint] = None if override is None else dict(override)
+    return merged
+
+
+def resolve_speed_options(
+    agent: AgentConfig, provider_type: str, hint: str | None
+) -> dict[str, Any] | None:
+    """Options the adapter should apply for THIS turn given the client hint.
+
+    Returns a dict of structured options (the shape the adapter's
+    `_build_extra_body` expects), or None if no options apply — either
+    because no hint was sent, the agent disabled it, or the provider
+    has nothing to say about that hint.
+    """
+    if not hint:
+        return None
+    merged = effective_speed_hints(agent, provider_type)
+    options = merged.get(hint)
+    if not options:  # covers None (disabled) and {} (no-op)
+        return None
+    return dict(options)
 
 
 # ---------------------------------------------------------------------------
@@ -854,6 +910,7 @@ async def run_user_turn(
     provider_factory=None,
     max_tokens: int | None = None,
     client_timezone: str | None = None,
+    speed: str | None = None,
 ) -> AsyncIterator[RuntimeEvent]:
     """Persist the user message, then drive the model → tools → model loop.
 
@@ -941,6 +998,9 @@ async def run_user_turn(
         api_key=provider_cfg.api_key,
         base_url=provider_cfg.base_url,
     )
+    speed_options = resolve_speed_options(
+        agent, provider_cfg.provider_type, speed
+    )
     skills_for_session = loaded_skills(session_id)
     project = session_project(conn, session_id)
 
@@ -982,6 +1042,7 @@ async def run_user_turn(
                 # on run_user_turn (whole-turn token budget). Falls back to
                 # 4096 to match every provider adapter's def-time default.
                 max_tokens=agent.max_output_tokens or 4096,
+                speed_options=speed_options,
             ):
                 if isinstance(evt, TextDelta):
                     turn_text += evt.text
@@ -1290,6 +1351,7 @@ async def run_and_publish(
     user_text: str,
     max_tokens: int | None = None,
     client_timezone: str | None = None,
+    speed: str | None = None,
 ) -> None:
     """Drive a user turn and publish each event to the broker.
 
@@ -1318,6 +1380,7 @@ async def run_and_publish(
             user_text=user_text,
             max_tokens=max_tokens,
             client_timezone=client_timezone,
+            speed=speed,
         ):
             wire = event_to_wire(evt)
             wire["session_id"] = session_id

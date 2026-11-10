@@ -175,7 +175,7 @@ async def test_run_user_turn_ids_match_persisted_history(ark_home, tmp_path):
     sid = runtime.create_session(conn, "scribe", "conversational")
 
     class _StubProvider:
-        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096):
+        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096, speed_options=None):
             yield TurnUsageEvent(input_tokens=100, output_tokens=50, model=model)
             yield TextDelta(text="answer")
             yield AssistantTurnEnd(text="answer", stop_reason="end_turn")
@@ -216,7 +216,7 @@ async def test_tool_result_gets_event_id_matching_row(ark_home, tmp_path):
         def __init__(self):
             self.n = 0
 
-        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096):
+        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096, speed_options=None):
             self.n += 1
             if self.n == 1:
                 yield TurnUsageEvent(input_tokens=50, output_tokens=10, model=model)
@@ -348,7 +348,7 @@ async def test_live_event_id_matches_catch_up_id(ark_home, tmp_path):
     conn = client.app.state.conn
 
     class _StubProvider:
-        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096):
+        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096, speed_options=None):
             yield TurnUsageEvent(input_tokens=10, output_tokens=5, model=model)
             yield TextDelta(text="hi")
             yield AssistantTurnEnd(text="hi", stop_reason="end_turn")

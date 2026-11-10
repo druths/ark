@@ -56,7 +56,7 @@ class _ScriptedProvider:
         self._scripts = list(scripts)
         self.calls = 0
 
-    async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096):
+    async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096, speed_options=None):
         self.calls += 1
         script = self._scripts.pop(0) if self._scripts else []
         for evt in script:

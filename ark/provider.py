@@ -129,6 +129,12 @@ def _shared_marker(msg: SharedFile) -> str:
 
 
 class Provider(Protocol):
+    # Provider-type baseline for client "speed" hints — see
+    # runtime.resolve_speed_options. Each key is a hint name (e.g. "fast");
+    # each value is a dict of structured options the adapter knows how to
+    # apply. Empty for providers that have no speed knob.
+    DEFAULT_SPEED_HINTS: dict[str, dict[str, Any]] = {}
+
     async def stream_turn(
         self,
         *,
@@ -137,6 +143,7 @@ class Provider(Protocol):
         messages: list[Message],
         tools: list[ToolSchema],
         max_tokens: int = 4096,
+        speed_options: dict[str, Any] | None = None,
     ) -> AsyncIterator[ProviderEvent]: ...
 
 
@@ -146,6 +153,8 @@ class Provider(Protocol):
 
 
 class AnthropicProvider:
+    DEFAULT_SPEED_HINTS: dict[str, dict[str, Any]] = {}
+
     def __init__(self, api_key: str, base_url: str | None = None) -> None:
         kwargs: dict[str, Any] = {"api_key": api_key}
         if base_url:
@@ -160,7 +169,11 @@ class AnthropicProvider:
         messages: list[Message],
         tools: list[ToolSchema],
         max_tokens: int = 4096,
+        speed_options: dict[str, Any] | None = None,
     ) -> AsyncIterator[ProviderEvent]:
+        # Anthropic direct has no latency/throughput sort knob; the hint is
+        # silently ignored (per "hint, not contract").
+        del speed_options
         api_messages = to_anthropic_messages(messages)
         api_tools = [to_anthropic_tool(t) for t in tools]
         kwargs: dict[str, Any] = {
@@ -382,6 +395,8 @@ def _translate(event: Any, state: _State, model: str = "") -> Iterable[ProviderE
 
 
 class OpenAIProvider:
+    DEFAULT_SPEED_HINTS: dict[str, dict[str, Any]] = {}
+
     def __init__(self, api_key: str, base_url: str | None = None) -> None:
         kwargs: dict[str, Any] = {"api_key": api_key}
         if base_url:
@@ -396,6 +411,7 @@ class OpenAIProvider:
         messages: list[Message],
         tools: list[ToolSchema],
         max_tokens: int = 4096,
+        speed_options: dict[str, Any] | None = None,
     ) -> AsyncIterator[ProviderEvent]:
         api_messages = to_openai_messages(system, messages)
         api_tools = [to_openai_tool(t) for t in tools] or None
@@ -411,9 +427,19 @@ class OpenAIProvider:
         }
         if api_tools:
             kwargs["tools"] = api_tools
+        extra_body = self._build_extra_body(speed_options)
+        if extra_body:
+            kwargs["extra_body"] = extra_body
         stream = await self._client.chat.completions.create(**kwargs)
         async for evt in _translate_openai_stream(stream, model=model):
             yield evt
+
+    def _build_extra_body(
+        self, speed_options: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        # OpenAI direct ignores speed_options; overridden by OpenRouter.
+        del speed_options
+        return {}
 
 
 class OpenRouterProvider(OpenAIProvider):
@@ -426,8 +452,26 @@ class OpenRouterProvider(OpenAIProvider):
 
     DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 
+    # OpenRouter's provider-routing `sort` field is a first-class latency knob
+    # (same model, picks the lowest-latency provider). `fast` is the only
+    # baked-in hint; agents can add more via AgentConfig.speed_hints.
+    # https://openrouter.ai/docs/features/provider-routing
+    DEFAULT_SPEED_HINTS: dict[str, dict[str, Any]] = {
+        "fast": {"provider_sort": "latency"},
+    }
+
     def __init__(self, api_key: str, base_url: str | None = None) -> None:
         super().__init__(api_key=api_key, base_url=base_url or self.DEFAULT_BASE_URL)
+
+    def _build_extra_body(
+        self, speed_options: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        if not speed_options:
+            return {}
+        sort = speed_options.get("provider_sort")
+        if sort not in ("latency", "throughput", "price"):
+            return {}
+        return {"provider": {"sort": sort}}
 
 
 def to_openai_messages(system: str, messages: list[Message]) -> list[dict[str, Any]]:
@@ -593,6 +637,8 @@ class GoogleProvider:
       calls back to us instead of trying to dispatch them itself.
     """
 
+    DEFAULT_SPEED_HINTS: dict[str, dict[str, Any]] = {}
+
     def __init__(self, api_key: str, base_url: str | None = None) -> None:
         client_kwargs: dict[str, Any] = {"api_key": api_key}
         if base_url:
@@ -607,7 +653,10 @@ class GoogleProvider:
         messages: list[Message],
         tools: list[ToolSchema],
         max_tokens: int = 4096,
+        speed_options: dict[str, Any] | None = None,
     ) -> AsyncIterator[ProviderEvent]:
+        # Gemini direct has no latency/throughput sort knob.
+        del speed_options
         contents = to_google_contents(messages)
         config_kwargs: dict[str, Any] = {
             "max_output_tokens": max_tokens,

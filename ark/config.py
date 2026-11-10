@@ -76,6 +76,15 @@ class AgentConfig:
     # output summed across iterations). Null → runtime.DEFAULT_TURN_TOKEN_BUDGET.
     # Per-cron entries can further override this via crons.max_tokens.
     max_turn_tokens: int | None = None
+    # Per-agent overrides for client-supplied `speed` hints on a turn.
+    # Each key is a hint name (e.g. "fast"); the value is either a dict of
+    # structured options the provider knows about (e.g.
+    # {"provider_sort": "latency"} for OpenRouter), or None to explicitly
+    # disable the provider-type's built-in default for that hint. A missing
+    # key leaves the provider-type's default in place; an empty dict means
+    # "apply no options for this hint" (same effect as null, but explicit).
+    # Resolution happens in runtime.resolve_speed_options.
+    speed_hints: dict[str, dict[str, Any] | None] | None = None
 
 
 @dataclass
@@ -285,6 +294,28 @@ def _agents(
             raise ConfigError(
                 f"agents.{name}.max_turn_tokens must be a positive integer if set"
             )
+        speed_hints_raw = cfg.get("speed_hints")
+        speed_hints: dict[str, dict[str, Any] | None] | None = None
+        if speed_hints_raw is not None:
+            if not isinstance(speed_hints_raw, dict):
+                raise ConfigError(
+                    f"agents.{name}.speed_hints must be an object"
+                )
+            speed_hints = {}
+            for hint_name, hint_cfg in speed_hints_raw.items():
+                if not isinstance(hint_name, str) or not hint_name:
+                    raise ConfigError(
+                        f"agents.{name}.speed_hints keys must be non-empty strings"
+                    )
+                if hint_cfg is None:
+                    speed_hints[hint_name] = None
+                elif isinstance(hint_cfg, dict):
+                    speed_hints[hint_name] = dict(hint_cfg)
+                else:
+                    raise ConfigError(
+                        f"agents.{name}.speed_hints.{hint_name} must be an "
+                        f"object or null"
+                    )
         out[name] = AgentConfig(
             name=name,
             provider=provider,
@@ -298,5 +329,6 @@ def _agents(
             compaction_enabled=compaction_enabled,
             compaction_threshold=float(compaction_threshold),
             max_turn_tokens=max_turn_tokens,
+            speed_hints=speed_hints,
         )
     return out

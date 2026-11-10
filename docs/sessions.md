@@ -448,7 +448,7 @@ different identifier space.
 
 | Command | Required fields | Effect |
 |---|---|---|
-| `user_message` | `session_id`, `text`, optional `timezone` (IANA zone, e.g. `"America/Los_Angeles"`) | Start a new turn in that session. Multiple sessions can have turns running concurrently — events stream back tagged with their `session_id`. If `timezone` is included, the server uses it for the [Date markers](#date-markers) comparison and the Environment stanza's "today's date" line (otherwise UTC). Invalid or non-string → silent fallback to UTC. |
+| `user_message` | `session_id`, `text`, optional `timezone` (IANA zone, e.g. `"America/Los_Angeles"`), optional `speed` (e.g. `"fast"`) | Start a new turn in that session. Multiple sessions can have turns running concurrently — events stream back tagged with their `session_id`. If `timezone` is included, the server uses it for the [Date markers](#date-markers) comparison and the Environment stanza's "today's date" line (otherwise UTC). Invalid or non-string → silent fallback to UTC. If `speed` is included, see [Speed hints](#speed-hints) — it's a per-turn, provider-specific routing nudge, strictly a hint. |
 | `stop` | `session_id` | Cancel the in-flight turn for that session. Fire-and-forget: the cancellation lands as a terminal `done {"stopped": true, "stop_reason": "stopped"}` on the events stream. Silent no-op when no turn is running. Also terminates any in-flight `run_command` process group (SIGTERM immediately, SIGKILL after a 5s grace) so long-running shell commands don't outlive the cancel. |
 
 Per-session context is **not** added over the WS — it's a REST operation
@@ -644,6 +644,82 @@ partial output is persisted, the run loop terminates naturally, and the
 client sees `done` with `stop_reason: "max_tokens"`. No `RunError`.
 Clients that want to make truncation visible can special-case that
 `stop_reason` in their UI.
+
+## Speed hints
+
+Clients can suggest a response "speed" per turn via the optional `speed`
+field on the `user_message` WS frame:
+
+```json
+{"type": "user_message", "session_id": "...", "text": "quick lookup?", "speed": "fast"}
+```
+
+The hint is strictly a **hint, not a contract**. It names a knob
+("fast"); whether anything happens depends on the agent's provider:
+
+- **OpenRouter** — built-in `fast → provider.sort: "latency"`. The same
+  model is requested, and OpenRouter biases provider selection toward
+  the lowest-latency endpoint. See
+  [OpenRouter: provider routing](https://openrouter.ai/docs/features/provider-routing).
+- **Anthropic / OpenAI / Gemini direct** — no built-in. The hint is a
+  silent no-op. "Fast" never means "switch to a smaller/cheaper model"
+  — that would change behavior, not just speed.
+
+Not sent, empty, or unknown value → nothing is applied; the turn runs
+with default routing.
+
+### Per-agent overrides (`speed_hints`)
+
+Each agent can override, extend, or disable hints on
+`AgentConfig.speed_hints`:
+
+```json
+"agents": {
+  "scribe": {
+    ...
+    "speed_hints": {
+      "fast":  { "provider_sort": "throughput" },
+      "cheap": null
+    }
+  }
+}
+```
+
+Resolution:
+
+- **Missing key** → provider-type's built-in default (if any).
+- **Object value** → overrides the baseline for this hint (keys depend
+  on provider — OpenRouter understands `provider_sort`:
+  `"latency" | "throughput" | "price"`).
+- **`null`** → explicitly disables the baseline. Different from "missing"
+  — missing keeps the default, `null` makes the hint a no-op on this agent.
+
+The merged (effective) map is visible via `GET /agents/{name}` under
+`speed_hints`, and printed by `ark agents <name>`.
+
+### CLI
+
+In `ark chat`, prefix a message with `/fast` to send that one turn with
+`speed: "fast"`, or type `/fast` alone to arm the next send:
+
+```
+you> /fast what's the capital of Belgium?    # one-shot
+you> /fast                                     # [/fast: armed for next send]
+you[fast]> ...                                 # next line goes out with speed=fast
+you>                                           # cleared after send
+```
+
+The hint is never sticky across turns — once a send goes out, the next
+prompt is back to default. This keeps "fast quietly rode along five turns
+I didn't ask about" from happening.
+
+### Audit trail
+
+The hint itself is not persisted in history. The provider adapter
+applies its chosen options at request time, and `TurnMetrics` records
+the actual model string used. For OpenRouter specifically, the
+`sort: "latency"` nudge leaves no trace in the response body beyond the
+turn being faster.
 
 ## Multi-modal input
 

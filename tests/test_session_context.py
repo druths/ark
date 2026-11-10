@@ -205,7 +205,7 @@ async def test_session_context_filtered_from_llm_messages(ark_home, tmp_path):
     captured = {}
 
     class _StubProvider:
-        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096):
+        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096, speed_options=None):
             captured["system"] = system
             captured["messages"] = list(messages)
             from ark.types import AssistantTurnEnd

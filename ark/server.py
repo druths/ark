@@ -115,6 +115,9 @@ def create_app(config: Config) -> FastAPI:
             "mcp_servers": mcp_status,
             "heartbeat_seconds": heartbeat["heartbeat_seconds"] if heartbeat else None,
             "crons": [dict(r) for r in crons],
+            "speed_hints": runtime.effective_speed_hints(
+                agent, provider_cfg.provider_type
+            ),
         }
 
     @app.put("/agents/{name}/heartbeat")
@@ -1050,6 +1053,8 @@ def create_app(config: Config) -> FastAPI:
                 # Invalid or absent → UTC fallback inside the runtime.
                 client_tz_raw = cmd.get("timezone")
                 client_tz = client_tz_raw if isinstance(client_tz_raw, str) else None
+                speed_raw = cmd.get("speed")
+                speed = speed_raw if isinstance(speed_raw, str) and speed_raw else None
                 asyncio.create_task(
                     runtime.run_and_publish(
                         conn=conn,
@@ -1058,6 +1063,7 @@ def create_app(config: Config) -> FastAPI:
                         session_id=sid,
                         user_text=cmd.get("text", ""),
                         client_timezone=client_tz,
+                        speed=speed,
                     )
                 )
         except WebSocketDisconnect:

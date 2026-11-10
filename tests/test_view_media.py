@@ -365,7 +365,7 @@ async def test_runtime_drains_attachments_into_tool_result(ark_home, tmp_path):
         def __init__(self):
             self.calls = 0
 
-        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096):
+        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096, speed_options=None):
             self.calls += 1
             captured_messages.append(list(messages))
             if self.calls == 1:

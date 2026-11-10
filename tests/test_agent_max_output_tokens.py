@@ -74,7 +74,7 @@ async def test_max_output_tokens_flows_to_provider(ark_home, tmp_path):
     seen: dict = {}
 
     class _StubProvider:
-        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096):
+        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096, speed_options=None):
             seen["max_tokens"] = max_tokens
             yield TextDelta(text="hi")
             yield AssistantTurnEnd(text="hi", stop_reason="end")
@@ -113,7 +113,7 @@ async def test_max_output_tokens_defaults_to_4096_when_none(ark_home, tmp_path):
     seen: dict = {}
 
     class _StubProvider:
-        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096):
+        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096, speed_options=None):
             seen["max_tokens"] = max_tokens
             yield TextDelta(text="hi")
             yield AssistantTurnEnd(text="hi", stop_reason="end")

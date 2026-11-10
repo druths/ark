@@ -237,7 +237,7 @@ async def test_run_user_turn_yields_date_marker_event(ark_home, tmp_path):
     captured: dict = {}
 
     class _StubProvider:
-        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096):
+        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096, speed_options=None):
             captured["system"] = system
             captured["messages"] = list(messages)
             yield TurnUsageEvent(input_tokens=50, output_tokens=10, model=model)
@@ -427,7 +427,7 @@ async def test_run_user_turn_threads_tz_through(ark_home, tmp_path):
     captured: dict = {}
 
     class _StubProvider:
-        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096):
+        async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096, speed_options=None):
             captured["system"] = system
             captured["messages"] = list(messages)
             yield TurnUsageEvent(input_tokens=50, output_tokens=10, model=model)

@@ -1,5 +1,82 @@
 # Changelog
 
+## Unreleased — Per-turn `speed` hint, OpenRouter latency-sort baked in
+
+Clients can now suggest a response "speed" per turn via a new optional
+`speed` field on the `user_message` WS frame:
+
+```json
+{"type": "user_message", "session_id": "...", "text": "...", "speed": "fast"}
+```
+
+Strictly a hint, not a contract. For OpenRouter-backed agents the
+built-in `fast` mapping adds `provider: {"sort": "latency"}` to the
+request body, biasing provider selection toward the lowest-latency
+endpoint for the same model. For Anthropic/OpenAI/Gemini direct, the
+hint is a silent no-op — "fast" never means "switch models."
+
+### Config: per-agent `speed_hints`
+
+Agents can override, extend, or disable hints:
+
+```json
+"agents": {
+  "scribe": {
+    ...
+    "speed_hints": {
+      "fast":  { "provider_sort": "throughput" },
+      "cheap": null
+    }
+  }
+}
+```
+
+- Missing key → provider-type baseline (OpenRouter's `fast`).
+- Object value → overrides baseline for that hint.
+- `null` → explicitly disables baseline on this agent (different from
+  missing: missing keeps the default, null makes it a no-op).
+
+### CLI
+
+- `ark chat`: `/fast <message>` sends that one turn with `speed: "fast"`.
+  `/fast` alone arms the next send (prompt becomes `you[fast]> `). The
+  hint is one-shot — it clears after each send so it never silently
+  rides along turns the user didn't ask for.
+- `ark agents <name>`: new subcommand that prints an agent's effective
+  hint map (merged baseline + overrides) alongside provider, model,
+  MCP servers, and crons. `ark agents` still lists.
+
+### Protocol / REST
+
+- `user_message` WS frame: optional `speed` string. Unknown/empty →
+  ignored.
+- `GET /agents/{name}`: now carries a `speed_hints` field with the
+  resolved (baseline ⊕ agent overrides) map.
+
+### Code layout
+
+- `Provider` protocol gains `DEFAULT_SPEED_HINTS: dict[str, dict]` and
+  `stream_turn(..., speed_options=None)`. OpenRouter class defines
+  `{"fast": {"provider_sort": "latency"}}`; direct adapters leave empty.
+- OpenAI adapter picks up a `_build_extra_body(options)` seam; OpenRouter
+  overrides it to translate `provider_sort` → `provider.sort` in
+  `extra_body`.
+- `runtime.resolve_speed_options(agent, provider_type, hint)` encodes
+  the baseline/override/null semantics so the adapter only sees the
+  dict it should apply (or None).
+
+### Tests
+
+`tests/test_speed_hints.py` (new, 21 cases):
+baselines, merge semantics (missing vs override vs null), resolution
+to None for no-hint / unknown-hint / disabled, OpenRouter
+`_build_extra_body` for latency/throughput/unknown/empty, OpenAI
+adapter drops `speed_options`, config loader accepts dict and null
+and rejects malformed values, end-to-end OpenRouter adapter actually
+sends `extra_body={"provider": {"sort": "latency"}}` and omits it
+when no hint is present. Existing provider stubs across 11 test
+files updated to accept the new `speed_options` kwarg.
+
 ## Unreleased — `share_with_client` now shares project-root files directly
 
 Previously `share_with_client` only accepted workspace-relative paths —
